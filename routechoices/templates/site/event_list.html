@@ -45,7 +45,7 @@
 <div class="container-fluid p-0">
   <div class="row m-0">
     <div class="w-100" style="background-color: #fff;">
-      <div class="container content">
+      <div class="container content" style="min-height: 100px">
         <div class="row">
           {{club.description|markdownify }}
         </div>
@@ -120,6 +120,7 @@
     {% endfor %}
   {% endfor %}
   </div>
+  <hr/>
   {% endif%}
   {% if upcoming_events %}
   <div>
@@ -167,6 +168,9 @@
     {% endfor %}
   {% endfor %}
   </div>
+  {% if years or search_text or event_set_page and events %}
+  <hr/>
+  {% endif%}
   {% endif%}
   {% if years or search_text or event_set_page and events %}
   <div {% if not event_set_page %}class="mb-3"{% endif%}>
@@ -242,7 +246,7 @@
   {% if not live_events and not events and not upcoming_events %}
     <div class="card">
       <div class="card-body">
-        <h2 style="color: #888">No {% if event_set_page and event_set.hide_secret_events %}public {% endif %}events...</h2>
+        <h2 style="color: #888">No {% if not event_set_page or event_set.hide_secret_events %}public {% endif %}events...</h2>
       </div>
     </div>
   {% endif %}

@@ -275,10 +275,7 @@ Follow our events live or replay them later.
 
     @property
     def logo_url(self):
-        path = reverse(
-            "club_logo", host="clubs", host_kwargs={"club_slug": self.slug.lower()}
-        )
-        return f"https:{path}{self.logo_last_mod}"
+        return f"{self.nice_url}logo{self.logo_last_mod}"
 
     def validate_unique(self, exclude=None):
         super().validate_unique(exclude)
@@ -925,6 +922,7 @@ MAP_MAPANT_ES = "mapant-es"
 MAP_TOPO_FI = "topo-fi"
 MAP_TOPO_FR = "topo-fr"
 MAP_TOPO_NO = "topo-no"
+MAP_TOPO_UK = "topo-uk"
 MAP_TOPO_WRLD = "topo-world"
 MAP_TOPO_WRLD_ALT = "topo-world-alt"
 
@@ -940,6 +938,7 @@ MAP_CHOICES = (
     (MAP_TOPO_FI, "Topo Finland"),
     (MAP_TOPO_FR, "Topo France"),
     (MAP_TOPO_NO, "Topo Norway"),
+    (MAP_TOPO_UK, "Topo UK"),
     (MAP_TOPO_WRLD, "Topo World (OpenTopo)"),
     (MAP_TOPO_WRLD_ALT, "Topo World (ArcGIS)"),
 )
@@ -1514,11 +1513,14 @@ class Event(models.Model):
     def invalidate_cache(self):
         t0 = time.time()
         cache_interval = EVENT_CACHE_INTERVAL
-        cache_ts = int(t0 // (cache_interval if self.is_live else 7 * 24 * 3600))
-        cache_prefix = "live" if self.is_live else "archived"
-        cache_key = f"{cache_prefix}_event_data:{self.aid}:{cache_ts}"
-        cache.delete(cache_key)
-        cache.delete(f"etag-{cache_key}")
+        for cache_prefix in ("live", "archived"):
+            cache_ts = int(
+                t0 // (cache_interval if cache_prefix == "live" else 7 * 24 * 3600)
+            )
+            cache_key = f"{cache_prefix}_event_data:{self.aid}:{cache_ts}"
+            cache.delete(cache_key)
+            cache_key = f"{cache_prefix}_event_data:{self.aid}:{cache_ts - 1}"
+            cache.delete(cache_key)
 
     @property
     def has_notice(self):

@@ -224,6 +224,7 @@ class NoticeInline(admin.TabularInline):
 class EventAdmin(admin.ModelAdmin):
     list_display = (
         "name",
+        "event_set",
         "club",
         "start_date",
         "privacy",
@@ -237,6 +238,7 @@ class EventAdmin(admin.ModelAdmin):
         return (
             super()
             .get_queryset(request)
+            .select_related("event_set")
             .annotate(competitor_count=Count("competitors"))
         )
 
@@ -260,6 +262,12 @@ class DeviceCompetitorInline(admin.TabularInline):
         return mark_safe(f'<a href="{obj.event.get_absolute_url()}">View on Site</a>')
 
 
+class DeviceOwnershipInline(admin.TabularInline):
+    model = DeviceClubOwnership
+    fields = ("club", "nickname")
+    ordering = ("creation_date",)
+
+
 class DeviceAdmin(admin.ModelAdmin):
     list_display = (
         "aid",
@@ -272,11 +280,12 @@ class DeviceAdmin(admin.ModelAdmin):
         "battery_level",
         "competitor_count",
     )
-    readonly_fields = ("last_hundred_locations",)
+    readonly_fields = ("last_hundred_locations", "imei")
     actions = ["clean_positions"]
     search_fields = ("aid",)
     inlines = [
         DeviceCompetitorInline,
+        DeviceOwnershipInline,
     ]
     list_filter = (
         IsGPXFilter,
@@ -313,6 +322,11 @@ class DeviceAdmin(admin.ModelAdmin):
 
     def last_location_datetime(self, obj):
         return obj._last_location_datetime
+
+    def imei(self, obj):
+        if obj.physical_device:
+            return obj.physical_device.imei
+        return ""
 
     def last_coordinates(self, obj):
         return obj._last_location_latitude, obj._last_location_longitude

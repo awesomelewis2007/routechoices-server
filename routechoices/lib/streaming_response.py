@@ -48,7 +48,6 @@ def StreamingHttpRangeResponse(request, data, **kwargs):
     if not content_type:
         content_type = magic.from_buffer(data, mime=True) or "application/octet-stream"
     fileIO = BytesIO(data)
-
     if range_match:
         first_byte, last_byte = range_match.groups()
         first_byte = int(first_byte) if first_byte else 0

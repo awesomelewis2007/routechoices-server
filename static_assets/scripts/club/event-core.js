@@ -200,11 +200,11 @@ L.Control.Ranking = L.Control.extend({
     ) {
       u(".leaflet-control-ranking").prepend(
         '<div class="result-list-title">' +
-          "<h6>" +
+          '<h6><i class="fa-solid fa-trophy"></i> ' +
           banana.i18n("ranking") +
           "</h6><label>" +
           banana.i18n("crossing-count") +
-          '</label>&nbsp;<input type="number" min="1" id="crossing-time" step="1" value="1" class="d-inline-block cross-count form-control" style="font-size: 0.7rem;width: 75px">' +
+          '</label><input type="number" min="1" id="crossing-time" step="1" value="1" class="d-block cross-count form-control" style="font-size: 0.7rem;width: 61px">' +
           "</div>"
       );
     }
@@ -1654,12 +1654,12 @@ function checkVisible(elm) {
 function drawCompetitors() {
   // play/pause button
   if (playbackPaused) {
-    var html = '<i class="fa-solid fa-play"></i> x' + playbackRate;
+    var html = '<i class="fa-solid fa-play fa-fw"></i> x' + playbackRate;
     if (u("#play_pause_button").html() != html) {
       u("#play_pause_button").html(html);
     }
   } else {
-    var html = '<i class="fa-solid fa-pause"></i> x' + playbackRate;
+    var html = '<i class="fa-solid fa-pause fa-fw"></i> x' + playbackRate;
     if (u("#play_pause_button").html() != html) {
       u("#play_pause_button").html(html);
     }
