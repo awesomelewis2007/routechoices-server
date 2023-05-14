@@ -73,6 +73,13 @@ class ClubForm(ModelForm):
                 self.instance.slug_changed_at
                 and self.instance.slug_changed_at
                 > arrow.now().shift(hours=-72).datetime
+                and not (
+                    (
+                        self.instance.slug_changed_from
+                        and slug == self.instance.slug_changed_from
+                    )
+                    or slug == self.instance.slug
+                )
             ):
                 raise ValidationError(
                     "Domain prefix can be changed only once every 72 hours."
@@ -381,11 +388,17 @@ class CompetitorForm(ModelForm):
         start = self.cleaned_data.get("start_time")
         orig_event = self.cleaned_data.get("event")
         if self.data.get("start_date"):
-            event_start = get_aware_datetime(self.data.get("start_date"))
+            try:
+                event_start = get_aware_datetime(self.data.get("start_date"))
+            except Exception:
+                event_start = orig_event.start_date
         else:
             event_start = orig_event.start_date
         if self.data.get("end_date"):
-            event_end = get_aware_datetime(self.data.get("end_date"))
+            try:
+                event_end = get_aware_datetime(self.data.get("end_date"))
+            except Exception:
+                event_end = orig_event.end_date
         else:
             event_end = orig_event.end_date
         if start and (event_start > start or start > event_end):

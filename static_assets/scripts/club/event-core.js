@@ -323,10 +323,10 @@ function getContrastYIQ(hexcolor) {
 function getRunnerIcon(color, faded = false, focused = false) {
   var iconSize = 16;
   var liveColor = tinycolor(color).setAlpha(faded ? 0.4 : 0.75);
-  var isDark = getContrastYIQ(color) === "dark";
-  var svgRect = `<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><circle fill="${liveColor.toRgbString()}" stroke="${
-    isDark ? "white" : "black"
-  }" stroke-width="${focused ? 3 : 1}px" cx="8" cy="8" r="6"/></svg>`;
+  //var isDark = getContrastYIQ(color) === "dark";
+  var svgRect = `<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><circle fill="${liveColor.toRgbString()}" stroke="black" stroke-width="${
+    focused ? 3 : 1
+  }px" cx="8" cy="8" r="6"/></svg>`;
   var runnerIcon = L.icon({
     iconUrl: encodeURI("data:image/svg+xml," + svgRect),
     iconSize: [iconSize, iconSize],
@@ -347,7 +347,11 @@ function getRunnerNameMarker(
   focused = false
 ) {
   var iconHtml =
-    '<span style="opacity: ' +
+    '<span style="' +
+    (focused
+      ? "padding-bottom: 0px;border-bottom: 4px solid " + color + ";"
+      : "") +
+    "opacity: " +
     (faded ? 0.4 : 0.75) +
     ";color: " +
     color +
@@ -371,7 +375,10 @@ function getRunnerNameMarker(
   var runnerIcon = L.divIcon({
     className: iconClass,
     html: iconHtml,
-    iconAnchor: [rightSide ? nameTagWidth : 0, 0],
+    iconAnchor: [
+      rightSide ? nameTagWidth + (focused ? 10 : 0) : focused ? -10 : 0,
+      0,
+    ],
   });
   return runnerIcon;
 }
@@ -821,7 +828,7 @@ function refreshEventData() {
         var currentMapStillExists = response.maps.find(function (m) {
           return rasterMap && m.id === rasterMap.data.id;
         });
-        if (rasterMap && (currentMapNewData || response.maps.length === 0)) {
+        if (rasterMap && (currentMapNewData || response.maps.length <= 1)) {
           rasterMap.remove();
         }
         if (mapSelectorLayer) {
@@ -833,7 +840,8 @@ function refreshEventData() {
             var m = response.maps[i];
             if (
               (currentMapStillExists && m.id === currentMapStillExists.id) ||
-              (!currentMapStillExists && m.default)
+              (!currentMapStillExists && m.default) ||
+              response.maps.length === 1
             ) {
               m.title =
                 !m.title && m.default
@@ -849,8 +857,8 @@ function refreshEventData() {
                 bounds,
                 m.hash,
                 m.max_zoom,
-                currentMapNewData,
-                i,
+                currentMapNewData || response.maps.length === 1,
+                i + 1,
                 m
               );
               mapChoices[m.title] = rasterMap;
@@ -868,7 +876,7 @@ function refreshEventData() {
               mapChoices[m.title] = L.tileLayer.wms(
                 window.local.wmsServiceUrl + "?v=" + m.hash,
                 {
-                  layers: window.local.eventId + "/" + i,
+                  layers: window.local.eventId + "/" + (i + 1),
                   bounds: bounds,
                   tileSize: 512,
                   noWrap: true,
@@ -1104,12 +1112,12 @@ function displayCompetitorList(force) {
     nbShown += competitor.isShown ? 1 : 0;
     var div = u('<div class="card-body px-1 pt-1 pb-0"/>');
     div.html(
-      '<div class="float-start color-tag me-1" style="cursor: pointer"><i class="media-object fa-solid fa-circle fa-3x icon-sidebar" style="font-size: 1em;color:' +
+      '<div><div class="text-nowrap text-truncate overflow-hidden" style="line-height: 18px"><span class="color-tag me-0" style="cursor: pointer"><i class="media-object fa-3x fa-solid fa-circle icon-sidebar" style="margin-left:1px;font-size:1em;color:' +
         competitor.color +
-        '"></i></div>\
-        <div><div class="text-nowrap overflow-hidden ps-0 text-truncate"><b>' +
+        '"></i></span>\
+        <span class="overflow-hidden ps-0 text-truncate"><b>' +
         u("<div/>").text(competitor.name).html() +
-        '</b></div>\
+        '</b></span></div>\
         <div class="text-nowrap text-truncate overflow-hidden ps-0 ' +
         (competitor.isShown ? "route-displayed" : "route-not-displayed") +
         '">' +
@@ -2434,7 +2442,7 @@ function shareUrl(e) {
 function updateText() {
   banana.setLocale(locale);
   var langFile = `${window.local.staticRoot}i18n/club/event/${locale}.json`;
-  return fetch(`${langFile}?v=2023041300`)
+  return fetch(`${langFile}?v=2023051200`)
     .then((response) => response.json())
     .then((messages) => {
       banana.load(messages, banana.locale);

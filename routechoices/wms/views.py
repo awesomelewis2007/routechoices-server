@@ -93,11 +93,11 @@ def common_wms(function):
                 if "/" in layers_raw:
                     event_id, map_index = layers_raw.split("/")
                     map_index = int(map_index)
-                    if map_index < 0:
+                    if map_index <= 0:
                         raise ValueError()
                 else:
                     event_id = layers_raw
-                    map_index = 0
+                    map_index = 1
             except Exception:
                 return HttpResponseBadRequest("invalid parameters")
 
@@ -196,7 +196,7 @@ def wms_service(request):
                         "map": event.map,
                     }
                 )
-                count_layer = 0
+                count_layer = 1
                 for layer in event.map_assignations.all():
                     count_layer += 1
                     layers.append(

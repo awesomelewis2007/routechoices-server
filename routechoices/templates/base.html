@@ -2,7 +2,7 @@
 <html lang='en-US'>
   <head>
     <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
-    <meta name="viewport" content="initial-scale=1.0, user-scalable=no" />
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     {% block favicon %}<link rel="apple-touch-icon" href="{% static 'apple-touch-icon.png' %}?v=2023c">
     <link rel="icon" sizes="32x32" href="{% static 'favicon.ico' %}?v=2023c">
     <link rel="manifest" href="{% static 'manifest.json' %}?v=2023c">{% endblock %}
@@ -12,7 +12,7 @@
     <meta name="description" content="{% block head_description %}{{site.name}} is a free and open source live GPS tracking solution for orienteering events. View the competitors locations in the forest on computer or phone screens.{% endblock %}">
     <title>{% block head_title %}{{site.name}} | Live GPS tracking for orienteering{% endblock %}</title>
     {% compress css %}
-    <link rel="stylesheet" href="{% static '/vendor/fontawesome-free-6.4.0-web/css/all.min.css' %}"/>
+    <link rel="stylesheet" href="{% static '/vendor/fontawesome-free-6.4.0-web/css/all.css' %}"/>
     <link rel="stylesheet" href="{% static '/vendor/bootstrap-5.2.3/bootstrap.min.css' %}"/>
     <link rel="stylesheet" href="{% static '/vendor/bootstrap_sweetalert-1.0.1/sweetalert.css' %}"/>
     <link rel="stylesheet" href="{% static '/styles/site.css' %}" />
@@ -39,7 +39,9 @@
     {% include "navbar.html" %}
     {% endif %}
     {% endblock %}
+    <div id="django-messages">
     {% bootstrap_messages %}
+    </div>
     <div class='notifications top-right'></div>
     {% block contentup %}
     <div class="container content">

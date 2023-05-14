@@ -54,6 +54,20 @@ var backdropMaps = {
     attribution: "&copy; MapAnt.no",
     className: "wms256",
   }),
+  "mapant-ch": L.tileLayer(
+    "https://tile-proxy.routechoices.com/ch/{z}/{x}/{y}.jpg",
+    {
+      attribution: "&copy; MapAnt.ch",
+      className: "wms256",
+    }
+  ),
+  "mapant-se": L.tileLayer(
+    "https://tile-proxy.routechoices.com/se/{z}/{x}/{y}.jpg",
+    {
+      attribution: "&copy; gokartor.se",
+      className: "wms256",
+    }
+  ),
   "topo-fr": L.tileLayer(
     "https://wxs.ign.fr/choisirgeoportail/geoportail/wmts?layer=GEOGRAPHICALGRIDSYSTEMS.PLANIGNV2&style=normal&tilematrixset=PM&Service=WMTS&Request=GetTile&Version=1.0.0&Format=image%2Fpng&tilematrix={z}&tilecol={x}&tilerow={y}",
     {
@@ -176,6 +190,8 @@ function getBaseLayers() {
     "Mapant Finland": cloneLayer(backdropMaps["mapant-fi"]),
     "Mapant Norway": cloneLayer(backdropMaps["mapant-no"]),
     "Mapant Spain": cloneLayer(backdropMaps["mapant-es"]),
+    "Mapant Sweden": cloneLayer(backdropMaps["mapant-se"]),
+    "Mapant Switzerland": cloneLayer(backdropMaps["mapant-ch"]),
     "Topo Finland": cloneLayer(backdropMaps["topo-fi"]),
     "Topo France": cloneLayer(backdropMaps["topo-fr"]),
     "Topo Norway": cloneLayer(backdropMaps["topo-no"]),
