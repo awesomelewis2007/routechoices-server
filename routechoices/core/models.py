@@ -12,18 +12,15 @@ from operator import itemgetter
 from zipfile import ZipFile
 
 import cv2
-import gps_encoding
+import gps_data_codec
 import gpxpy
 import gpxpy.gpx
 import magic
 import numpy as np
-import orjson as json
-import redis
 from allauth.account.models import EmailAddress
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.contrib.gis.geos import LinearRing, Polygon
-from django.contrib.sites.shortcuts import get_current_site
 from django.core.cache import cache
 from django.core.exceptions import BadRequest, PermissionDenied, ValidationError
 from django.core.files.base import ContentFile, File
@@ -31,8 +28,8 @@ from django.core.mail import EmailMessage
 from django.core.paginator import Paginator
 from django.core.validators import MaxValueValidator, MinValueValidator, validate_slug
 from django.db import models
-from django.db.models import Q
-from django.db.models.functions import ExtractMonth, ExtractYear
+from django.db.models import F, Min, Q
+from django.db.models.functions import ExtractMonth, ExtractYear, Upper
 from django.db.models.signals import post_delete, pre_delete
 from django.dispatch import receiver
 from django.http.response import Http404
@@ -41,7 +38,8 @@ from django.template.loader import render_to_string
 from django.utils.functional import cached_property
 from django.utils.timezone import now
 from django_hosts.resolvers import reverse
-from PIL import Image, ImageDraw, ImageFont
+from jxlpy import JXLImagePlugin  # noqa: F401
+from PIL import Image, ImageDraw
 from pillow_heif import register_avif_opener
 
 from routechoices.lib import plausible
@@ -53,6 +51,7 @@ from routechoices.lib.helpers import (
     distance_xy,
     epoch_to_datetime,
     general_2d_projection,
+    get_current_site,
     project,
     random_device_id,
     random_key,
@@ -85,16 +84,6 @@ LOCATION_TIMESTAMP_INDEX = 0
 LOCATION_LATITUDE_INDEX = 1
 LOCATION_LONGITUDE_INDEX = 2
 
-if settings.DATABASES["default"]["ENGINE"] not in (
-    "django.db.backends.postgresql",
-    "django.db.backends.sqlite3",
-):
-    raise Exception("DB not supported")
-
-IS_DB_POSTGRES = (
-    settings.DATABASES["default"]["ENGINE"] == "django.db.backends.postgresql"
-)
-
 
 class Point:
     def __init__(self, x, y=None):
@@ -113,9 +102,17 @@ class Point:
 
 
 def logo_upload_path(instance=None, file_name=None):
-    import os.path
-
     tmp_path = ["logos"]
+    time_hash = time_base64()
+    basename = instance.aid + "_" + time_hash
+    tmp_path.append(basename[0])
+    tmp_path.append(basename[1])
+    tmp_path.append(basename)
+    return os.path.join(*tmp_path)
+
+
+def banner_upload_path(instance=None, file_name=None):
+    tmp_path = ["banners"]
     time_hash = time_base64()
     basename = instance.aid + "_" + time_hash
     tmp_path.append(basename[0])
@@ -130,6 +127,7 @@ class Club(models.Model):
         max_length=12,
         editable=False,
         unique=True,
+        db_index=True,
     )
     creator = models.ForeignKey(
         User,
@@ -151,11 +149,8 @@ class Club(models.Model):
     )
     slug_changed_from = models.CharField(
         max_length=50,
-        validators=[
-            validate_domain_slug,
-        ],
+        validators=[validate_domain_slug],
         blank=True,
-        null=True,
         default="",
         editable=False,
     )
@@ -190,12 +185,41 @@ Follow our events live or replay them later.
         help_text="Image of size greater or equal than 128x128 pixels",
         storage=OverwriteImageStorage(aws_s3_bucket_name=settings.AWS_S3_BUCKET),
     )
+    banner = models.ImageField(
+        upload_to=banner_upload_path,
+        null=True,
+        blank=True,
+        help_text="Image of size greater or equal than 600x315 pixels",
+        storage=OverwriteImageStorage(aws_s3_bucket_name=settings.AWS_S3_BUCKET),
+    )
     analytics_site = models.URLField(max_length=256, blank=True)
+
+    upgraded = models.BooleanField(default=False)
+    upgraded_date = models.DateTimeField(blank=True, null=True)
+    order_id = models.CharField(max_length=200, blank=True, default="")
+    forbid_invite_request = models.BooleanField(
+        "Prevent external users to request admin rights", default=False
+    )
 
     class Meta:
         ordering = ["name"]
         verbose_name = "club"
         verbose_name_plural = "clubs"
+        indexes = [
+            models.Index(
+                Upper("slug"),
+                name="core_club_slug_upper_idx",
+            ),
+            models.Index(
+                Upper("domain"),
+                name="core_club_domain_upper_idx",
+            ),
+            models.Index(
+                Upper("slug_changed_from"),
+                F("slug_changed_at").desc(),
+                name="core_club_changed_slug_idx",
+            ),
+        ]
 
     def __str__(self):
         return self.name
@@ -252,9 +276,15 @@ Follow our events live or replay them later.
     def nice_url(self):
         if self.domain:
             return f"{self.url_protocol}://{self.domain}/"
-        path = reverse(
-            "club_view", host="clubs", host_kwargs={"club_slug": self.slug.lower()}
-        )
+        if getattr(settings, "USE_CUSTOM_DOMAIN_PREFIX", True):
+            path = reverse(
+                "club_view", host="clubs", host_kwargs={"club_slug": self.slug.lower()}
+            )
+        else:
+            path = reverse(
+                "site:club:club_view", kwargs={"club_slug": self.slug.lower()}
+            )
+            path = f"{path}"
         return f"{self.url_protocol}:{path}"
 
     def logo_scaled(self, width, ext="PNG"):
@@ -266,7 +296,7 @@ Follow our events live or replay them later.
         logo = Image.open(BytesIO(logo_b))
         logo_s = logo.resize((width, width), Image.BILINEAR)
         buffer = BytesIO()
-        logo_s.save(buffer, ext, quality=10)
+        logo_s.save(buffer, ext, quality=(40 if ext in ("AVIF", "JXL") else 80))
         return buffer.getvalue()
 
     @property
@@ -276,6 +306,48 @@ Follow our events live or replay them later.
     @property
     def logo_url(self):
         return f"{self.nice_url}logo{self.logo_last_mod}"
+
+    @property
+    def banner_url(self):
+        return f"{self.nice_url}banner?v={safe64encodedsha(self.banner.name)}"
+
+    def thumbnail(self, mime="image/jpeg"):
+        cache_key = f"club:{self.aid}:thumbnail:{self.modification_date}:{mime}"
+        if not self.banner:
+            cache_key = f"{cache_key}:blank"
+            cached = cache.get(cache_key)
+            if cached:
+                return cached
+            img = Image.new("RGB", (1200, 630), "WHITE")
+        else:
+            banner = self.banner
+
+            cached = cache.get(cache_key)
+            if cached:
+                return cached
+            orig = banner.open("rb").read()
+            img = Image.open(BytesIO(orig)).convert("RGBA")
+            white_bg_img = Image.new("RGBA", img.size, "WHITE")
+            white_bg_img.paste(img, (0, 0), img)
+            img = white_bg_img.convert("RGB")
+        logo = None
+        if self.logo:
+            logo_b = self.logo.open("rb").read()
+            logo = Image.open(BytesIO(logo_b))
+        elif not self.domain:
+            logo = Image.open("routechoices/watermark.png")
+        if logo:
+            logo_f = logo.resize((250, 250), Image.LANCZOS)
+            img.paste(logo_f, (int((1200 - 250) / 2), int((630 - 250) / 2)), logo_f)
+        buffer = BytesIO()
+        img.save(
+            buffer,
+            mime[6:].upper(),
+            quality=(40 if mime in ("image/avif", "image/jxl") else 80),
+        )
+        data_out = buffer.getvalue()
+        cache.set(cache_key, data_out, 31 * 24 * 3600)
+        return data_out
 
     def validate_unique(self, exclude=None):
         super().validate_unique(exclude)
@@ -294,8 +366,6 @@ def delete_club_receiver(sender, instance, using, **kwargs):
 
 
 def map_upload_path(instance=None, file_name=None):
-    import os.path
-
     tmp_path = ["maps"]
     time_hash = time_base64()
     basename = instance.aid + "_" + time_hash
@@ -316,6 +386,7 @@ class Map(models.Model):
         max_length=12,
         editable=False,
         unique=True,
+        db_index=True,
     )
     creation_date = models.DateTimeField(auto_now_add=True)
     modification_date = models.DateTimeField(auto_now=True)
@@ -356,7 +427,7 @@ class Map(models.Model):
 
     @property
     def data(self):
-        cache_key = f"img_data_{self.image.name}"
+        cache_key = f"map:{self.image.name}:data"
         cached = cache.get(cache_key)
         if cached:
             return cached
@@ -394,7 +465,7 @@ class Map(models.Model):
 
     @property
     def mime_type(self):
-        cache_key = f"img_mime_{self.image.name}"
+        cache_key = f"map:{self.image.name}:mime"
         cached = cache.get(cache_key)
         if cached:
             return cached
@@ -538,7 +609,7 @@ class Map(models.Model):
         ll_b = self.map_xy_to_wsg84(self.width, 0)
         ll_c = self.map_xy_to_wsg84(self.width, self.height)
         ll_d = self.map_xy_to_wsg84(0, self.height)
-        return (
+        resolution = (
             distance_xy(0, 0, 0, self.height)
             + distance_xy(0, self.height, self.width, self.height)
             + distance_xy(self.width, self.height, self.width, 0)
@@ -549,10 +620,15 @@ class Map(models.Model):
             + distance_latlon(ll_c, ll_d)
             + distance_latlon(ll_d, ll_a)
         )
+        return round(resolution, 3)
+
+    @property
+    def center(self):
+        return self.map_xy_to_wsg84(self.width / 2, self.height / 2)
 
     @property
     def max_zoom(self):
-        center_latitude = self.map_xy_to_wsg84(self.width / 2, self.height / 2)["lat"]
+        center_latitude = self.center["lat"]
         meters_per_pixel_at_zoom_18 = (
             40_075_016.686 * math.cos(center_latitude * math.pi / 180) / (2 ** (18 + 8))
         )
@@ -567,28 +643,36 @@ class Map(models.Model):
         bl = self.map_xy_to_spherical_mercator(0, self.height)
         rot = (
             (
-                math.atan2(tr[1] - tl[1], tr[0] - tl[0])
-                + math.atan2(br[1] - tr[1], br[0] - tr[0])
-                + math.atan2(bl[1] - br[1], bl[0] - br[0])
-                + math.atan2(tl[1] - bl[1], tl[0] - bl[0])
-                + math.pi
+                (
+                    math.atan2(tr[1] - tl[1], tr[0] - tl[0])
+                    + math.atan2(br[1] - bl[1], br[0] - bl[0])
+                )
+                + (
+                    math.atan2(tl[1] - bl[1], tl[0] - bl[0])
+                    + math.atan2(tr[1] - br[1], tr[0] - br[0])
+                    - math.pi
+                )
             )
             / 4
             * 180
             / math.pi
-            + 360
-        ) % 360
+        )
+        return round(rot, 2)
+
+    @property
+    def north_declination(self):
+        rot = self.rotation + 180
         if rot > 45:
             rot = (rot - 45) % 90 - 45
-        return rot
+        return round(rot, 2)
 
     def tile_cache_key(
         self, output_width, output_height, img_mime, min_lon, max_lon, min_lat, max_lat
     ):
         return (
-            f"tiles_{self.aid}_{self.hash}_"
-            f"{output_width}_{output_height}_"
-            f"{min_lon}_{max_lon}_{min_lat}_{max_lat}_"
+            f"map:{self.aid}:{self.hash}:tile:"
+            f"{output_width}x{output_height}:"
+            f"{min_lon},{max_lon},{min_lat},{max_lat}:"
             f"{img_mime}"
         )
 
@@ -620,7 +704,7 @@ class Map(models.Model):
                     return cached, CACHED_TILE
 
         if not self.intersects_with_tile(min_x, max_x, min_y, max_y):
-            blank_cache_key = f"blank_tile_{output_width}_{output_height}_{img_mime}"
+            blank_cache_key = f"tile:blank:{output_width}x{output_height}:{img_mime}"
             if use_cache:
                 try:
                     cached = cache.get(blank_cache_key)
@@ -634,23 +718,26 @@ class Map(models.Model):
                             pass
                         return cached, CACHED_BLANK_TILE
 
-            n_channels = 4 if img_mime != "image/jpeg" else 3
-            transparent_img = np.zeros(
-                (output_height, output_width, n_channels), dtype=np.uint8
-            )
-            extra_args = []
-            if img_mime == "image/webp":
-                extra_args = [int(cv2.IMWRITE_WEBP_QUALITY), 10]
-            elif img_mime == "image/jpeg":
-                transparent_img[:, :] = (255, 255, 255)
-                extra_args = [int(cv2.IMWRITE_JPEG_QUALITY), 10]
-            if img_mime == "image/avif":
-                color_coverted = cv2.cvtColor(transparent_img, cv2.COLOR_RGBA2BGRA)
-                pil_image = Image.fromarray(color_coverted)
+            if img_mime in ("image/avif", "image/jxl"):
                 buffer = BytesIO()
-                pil_image.save(buffer, "AVIF", quality=10)
+                pil_image = Image.new(
+                    mode="RGBA",
+                    size=(output_height, output_width),
+                    color=(255, 255, 255, 0),
+                )
+                pil_image.save(buffer, img_mime[6:].upper(), quality=10)
                 data_out = buffer.getvalue()
             else:
+                n_channels = 3 if img_mime == "image/jpeg" else 4
+                transparent_img = np.zeros(
+                    (output_height, output_width, n_channels), dtype=np.uint8
+                )
+                extra_args = []
+                if img_mime == "image/webp":
+                    extra_args = [int(cv2.IMWRITE_WEBP_QUALITY), 10]
+                elif img_mime == "image/jpeg":
+                    transparent_img[:, :] = (255, 255, 255)
+                    extra_args = [int(cv2.IMWRITE_JPEG_QUALITY), 10]
                 _, buffer = cv2.imencode(
                     f".{img_mime[6:]}",
                     transparent_img,
@@ -741,17 +828,17 @@ class Map(models.Model):
                 tile_img, (output_width, output_height), interpolation=cv2.INTER_AREA
             )
         extra_args = []
-        if img_mime == "image/webp":
-            extra_args = [int(cv2.IMWRITE_WEBP_QUALITY), 100]
-        elif img_mime == "image/jpeg":
-            extra_args = [int(cv2.IMWRITE_JPEG_QUALITY), 95]
-        if img_mime == "image/avif":
+        if img_mime in ("image/avif", "image/jxl"):
             color_coverted = cv2.cvtColor(tile_img, cv2.COLOR_BGRA2RGBA)
             pil_image = Image.fromarray(color_coverted)
             buffer = BytesIO()
-            pil_image.save(buffer, "AVIF", quality=80)
+            pil_image.save(buffer, img_mime[6:].upper(), quality=80)
             data_out = buffer.getvalue()
         else:
+            if img_mime == "image/webp":
+                extra_args = [int(cv2.IMWRITE_WEBP_QUALITY), 100]
+            elif img_mime == "image/jpeg":
+                extra_args = [int(cv2.IMWRITE_JPEG_QUALITY), 95]
             _, buffer = cv2.imencode(f".{img_mime[6:]}", tile_img, extra_args)
             data_out = BytesIO(buffer).getvalue()
 
@@ -822,14 +909,23 @@ class Map(models.Model):
         }
 
     @classmethod
-    def from_points(cls, seg):
+    def from_points(cls, seg, waypoints):
         new_map = cls()
 
         min_lat = 90
         max_lat = -90
         min_lon = 180
         max_lon = -180
-        for pts in seg:
+
+        line_color = (0xF5, 0x2F, 0xE4, 160)
+
+        all_segs = seg
+        if waypoints:
+            all_segs = seg + [
+                waypoints,
+            ]
+
+        for pts in all_segs:
             lats_lons = list(zip(*pts))
             lats = lats_lons[0]
             lons = lats_lons[1]
@@ -845,51 +941,70 @@ class Map(models.Model):
 
         res_scale = 4
         MAX_SIZE = 4000
-        offset = 30
-        width = tr_xy["x"] - tl_xy["x"] + offset * 2
-        height = tr_xy["y"] - br_xy["y"] + offset * 2
+        offset = 100
+        width = tr_xy["x"] - tl_xy["x"]
+        height = tr_xy["y"] - br_xy["y"]
 
         scale = 1
         if width > MAX_SIZE or height > MAX_SIZE:
             scale = max(width, height) / MAX_SIZE
 
-        tl_latlon = GLOBAL_MERCATOR.meters_to_latlon(
-            {"x": tl_xy["x"] - offset * scale, "y": tl_xy["y"] + offset * scale}
-        )
-        tr_latlon = GLOBAL_MERCATOR.meters_to_latlon(
-            {"x": tr_xy["x"] + offset * scale, "y": tr_xy["y"] + offset * scale}
-        )
-        br_latlon = GLOBAL_MERCATOR.meters_to_latlon(
-            {"x": br_xy["x"] + offset * scale, "y": br_xy["y"] - offset * scale}
-        )
-        bl_latlon = GLOBAL_MERCATOR.meters_to_latlon(
-            {"x": bl_xy["x"] - offset * scale, "y": bl_xy["y"] - offset * scale}
+        width = (tr_xy["x"] - tl_xy["x"]) / scale + 2 * offset
+        height = (tr_xy["y"] - br_xy["y"]) / scale + 2 * offset
+
+        corners = [
+            GLOBAL_MERCATOR.meters_to_latlon(
+                {"x": tl_xy["x"] - offset * scale, "y": tl_xy["y"] + offset * scale}
+            ),
+            GLOBAL_MERCATOR.meters_to_latlon(
+                {"x": tr_xy["x"] + offset * scale, "y": tr_xy["y"] + offset * scale}
+            ),
+            GLOBAL_MERCATOR.meters_to_latlon(
+                {"x": br_xy["x"] + offset * scale, "y": br_xy["y"] - offset * scale}
+            ),
+            GLOBAL_MERCATOR.meters_to_latlon(
+                {"x": bl_xy["x"] - offset * scale, "y": bl_xy["y"] - offset * scale}
+            ),
+        ]
+
+        new_map.corners_coordinates = ",".join(
+            f"{round(c['lat'], 5)},{round(c['lon'], 5)}" for c in corners
         )
 
-        new_map.corners_coordinates = (
-            f"{tl_latlon['lat']},{tl_latlon['lon']},"
-            f"{tr_latlon['lat']},{tr_latlon['lon']},"
-            f"{br_latlon['lat']},{br_latlon['lon']},"
-            f"{bl_latlon['lat']},{bl_latlon['lon']}"
-        )
         im = Image.new(
             "RGBA",
-            (int(width / scale) * res_scale, int(height / scale) * res_scale),
+            (int(width * res_scale), int(height * res_scale)),
             (255, 255, 255, 0),
         )
-        new_map.width = int(width / scale) * res_scale
-        new_map.height = int(height / scale) * res_scale
+        new_map.width = int(width * res_scale)
+        new_map.height = int(height * res_scale)
         draw = ImageDraw.Draw(im)
         for pts in seg:
             map_pts = [
                 new_map.wsg84_to_map_xy(pt[0], pt[1], round_values=True) for pt in pts
             ]
-            draw.line(map_pts, (255, 0, 0, 160), 15 * res_scale, joint="curve")
-            draw.line(map_pts, (255, 255, 255, 100), 10 * res_scale, joint="curve")
+            draw.line(map_pts, (255, 255, 255, 200), 22 * res_scale, joint="curve")
+            draw.line(map_pts, line_color, 16 * res_scale, joint="curve")
+        for pt in waypoints:
+            map_pt = new_map.wsg84_to_map_xy(pt[0], pt[1], round_values=True)
+            widths = [66, 63]
+            thicknesses = [22, 16]
 
-        im = im.resize(
-            (int(width / scale), int(height / scale)), resample=Image.Resampling.BICUBIC
-        )
+            colors = [(255, 255, 255, 200), line_color]
+            for i, w in enumerate(widths):
+                wr = w * res_scale
+                draw.ellipse(
+                    (
+                        map_pt[0] - wr,
+                        map_pt[1] - wr,
+                        map_pt[0] + wr,
+                        map_pt[1] + wr,
+                    ),
+                    outline=colors[i],
+                    width=int(thicknesses[i] * res_scale),
+                )
+
+        im = im.resize((int(width), int(height)), resample=Image.Resampling.BICUBIC)
         out_buffer = BytesIO()
         im.save(out_buffer, "WEBP", dpi=(72, 72), quality=80)
         f_new = File(out_buffer)
@@ -899,6 +1014,23 @@ class Map(models.Model):
             save=False,
         )
         return new_map
+
+    @property
+    def area(self):
+        # Area in km^2
+        ll_a = self.map_xy_to_wsg84(0, 0)
+        ll_b = self.map_xy_to_wsg84(self.width, 0)
+        ll_c = self.map_xy_to_wsg84(self.width, self.height)
+        ll_d = self.map_xy_to_wsg84(0, self.height)
+        return round(
+            (distance_latlon(ll_a, ll_b) + distance_latlon(ll_c, ll_d))
+            / 2
+            * (+distance_latlon(ll_a, ll_c) + distance_latlon(ll_b, ll_d))
+            / 2
+            / 1000
+            / 1000,
+            3,
+        )
 
 
 PRIVACY_PUBLIC = "public"
@@ -968,6 +1100,7 @@ class EventSet(models.Model):
         max_length=12,
         editable=False,
         unique=True,
+        db_index=True,
     )
     creation_date = models.DateTimeField(auto_now_add=True)
     modification_date = models.DateTimeField(auto_now=True)
@@ -995,6 +1128,14 @@ class EventSet(models.Model):
         default=False,
         help_text="Whether the page lists the secret events of the event set",
     )
+    description = models.TextField(
+        blank=True,
+        default="",
+        help_text=(
+            "This text will be displayed on the event set page, "
+            "use markdown formatting"
+        ),
+    )
 
     def save(self, *args, **kwargs):
         if not self.create_page:
@@ -1012,8 +1153,22 @@ class EventSet(models.Model):
     @property
     def url(self):
         if self.create_page:
-            return f"{self.club.nice_url}events/{self.slug}"
+            return f"{self.club.nice_url}{self.slug}"
         return ""
+
+    @property
+    def shortcut(self):
+        shortcut_url = getattr(settings, "SHORTCUT_BASE_URL", None)
+        if shortcut_url:
+            return f"{shortcut_url}{self.club.slug}/{self.slug}"
+        return None
+
+    @property
+    def shortcut_text(self):
+        shortcut_url = self.shortcut
+        if shortcut_url:
+            return shortcut_url.partition("://")[2]
+        return None
 
     @property
     def hide_secret_events(self):
@@ -1035,24 +1190,22 @@ class EventSet(models.Model):
                 qs = qs.exclude(id=self.id)
             if qs.exists():
                 errors.append("Event Set with this Club and Slug already exists.")
+            elif Event.objects.filter(
+                club_id=self.club_id, slug__iexact=self.slug
+            ).exists():
+                errors.append("Event with this Club and Slug already exists.")
         if errors:
             raise ValidationError(errors)
         super().validate_unique(exclude)
 
     def extract_event_lists(self, request):
-        event_qs = self.events
+        event_qs = self.events.select_related("club", "event_set").prefetch_related(
+            "competitors"
+        )
         if self.list_secret_events:
-            event_qs = (
-                event_qs.exclude(privacy=PRIVACY_PRIVATE)
-                .select_related("club", "event_set")
-                .prefetch_related("competitors")
-            )
+            event_qs = event_qs.exclude(privacy=PRIVACY_PRIVATE)
         else:
-            event_qs = (
-                event_qs.filter(privacy=PRIVACY_PUBLIC)
-                .select_related("club", "event_set")
-                .prefetch_related("competitors")
-            )
+            event_qs = event_qs.filter(privacy=PRIVACY_PUBLIC)
         past_event_qs = event_qs.filter(end_date__lt=now())
         live_events_qs = event_qs.filter(start_date__lte=now(), end_date__gte=now())
         upcoming_events_qs = event_qs.filter(
@@ -1069,7 +1222,7 @@ class EventSet(models.Model):
                 all_events_w_set = all_events_w_set.filter(
                     start_date__gt=now(),
                     start_date__lte=now() + timedelta(hours=24),
-                )
+                ).order_by("start_date", "name")
             else:
                 all_events_w_set = all_events_w_set.filter(end_date__lt=now())
             if not all_events_w_set.exists():
@@ -1114,19 +1267,22 @@ class Event(models.Model):
         max_length=12,
         editable=False,
         unique=True,
+        db_index=True,
     )
     creation_date = models.DateTimeField(auto_now_add=True)
     modification_date = models.DateTimeField(auto_now=True)
     club = models.ForeignKey(
-        Club, verbose_name="Club", related_name="events", on_delete=models.CASCADE
+        Club,
+        verbose_name="Club",
+        related_name="events",
+        on_delete=models.CASCADE,
+        db_index=True,
     )
     name = models.CharField(verbose_name="Name", max_length=255)
     slug = models.CharField(
         verbose_name="Slug",
         max_length=50,
-        validators=[
-            validate_nice_slug,
-        ],
+        validators=[validate_nice_slug],
         db_index=True,
         help_text="This is used to build the url of this event",
         default=short_random_slug,
@@ -1140,18 +1296,23 @@ class Event(models.Model):
         choices=PRIVACY_CHOICES,
         default=PRIVACY_PUBLIC,
         help_text=(
-            "Public: Listed on the front page | "
+            "Public: Listed on your club's front page | "
             "Secret: Can be opened with a link, however not listed on frontpage | "
             "Private: Only a logged in admin of the club can access the page"
         ),
     )
-    backdrop_map = BackroundMapChoicesField()
+    list_on_routechoices_com = models.BooleanField(
+        "Listed on Routechoices.com events page",
+        default=True,
+    )
+    backdrop_map = BackroundMapChoicesField(verbose_name="Background map")
     map = models.ForeignKey(
         Map,
-        related_name="+",
+        related_name="events_main_map",
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
+        db_index=True,
     )
     map_title = models.CharField(
         max_length=255,
@@ -1202,14 +1363,14 @@ class Event(models.Model):
             "Events within the same event set will be grouped together "
             "on the event listing page."
         ),
+        db_index=True,
     )
     emergency_contact = models.EmailField(
-        null=True,
+        default="",
         blank=True,
         help_text=(
-            "Email address of a person available to respond "
-            "in the case a competitor carrying a GPS tracker "
-            "with SOS feature enabled triggers the SOS button."
+            "Email address of a person available to respond in the case a competitor "
+            "carrying a GPS tracker with SOS feature enabled triggers the SOS button."
         ),
     )
 
@@ -1221,6 +1382,32 @@ class Event(models.Model):
         )
         verbose_name = "event"
         verbose_name_plural = "events"
+        indexes = [
+            models.Index(
+                Upper("slug"),
+                name="core_event_slug_upper_idx",
+            ),
+            models.Index(
+                "privacy",
+                "list_on_routechoices_com",
+                "end_date",
+                "event_set_id",
+                name="core_event_list_frontpage_idx",
+            ),
+            models.Index(
+                "privacy",
+                "club_id",
+                "end_date",
+                "event_set_id",
+                name="core_event_list_clubpage_idx",
+            ),
+            models.Index(
+                "privacy",
+                "list_on_routechoices_com",
+                "end_date",
+                name="core_event_listing_idx",
+            ),
+        ]
 
     def __str__(self):
         return self.name
@@ -1229,8 +1416,15 @@ class Event(models.Model):
         self.invalidate_cache()
         super().save(*args, **kwargs)
 
+    def check_user_permission(self, user):
+        if self.privacy == PRIVACY_PRIVATE and (
+            not user.is_authenticated
+            or not self.club.admins.filter(id=user.id).exists()
+        ):
+            raise PermissionDenied
+
     @classmethod
-    def get_public_map_at_index(cls, user, event_id, map_index):
+    def get_public_map_at_index(cls, user, event_id, map_index, load_competitors=False):
         """map_index is 1 based"""
         event_qs = (
             cls.objects.all()
@@ -1239,6 +1433,10 @@ class Event(models.Model):
                 start_date__lt=now(),
             )
         )
+        if load_competitors:
+            event_qs = event_qs.prefetch_related(
+                "competitors",
+            )
         try:
             map_index = int(map_index)
             if map_index <= 0:
@@ -1266,12 +1464,8 @@ class Event(models.Model):
         ):
             raise Http404
 
-        if event.privacy == PRIVACY_PRIVATE and not user.is_superuser:
-            if (
-                not user.is_authenticated
-                or not event.club.admins.filter(id=user.id).exists()
-            ):
-                raise PermissionDenied()
+        event.check_user_permission(user)
+
         if map_index == 0:
             raster_map = event.map
         else:
@@ -1290,15 +1484,16 @@ class Event(models.Model):
             .select_related("club", "event_set")
             .prefetch_related("competitors")
         )
-        if club is not None:
+        if club is None:
+            event_qs = event_qs.filter(list_on_routechoices_com=True)
+        else:
             event_qs = event_qs.filter(club=club)
 
         past_event_qs = event_qs.filter(end_date__lt=now())
         live_events_qs = event_qs.filter(start_date__lte=now(), end_date__gte=now())
         upcoming_events_qs = event_qs.filter(
             start_date__gt=now(), start_date__lte=now() + timedelta(hours=24)
-        )
-
+        ).order_by("start_date", "name")
         if search_text_raw:
             search_text = search_text_raw
             quoted_terms = re.findall(r"\"(.+?)\"", search_text)
@@ -1347,15 +1542,16 @@ class Event(models.Model):
             if selected_month:
                 past_event_qs = past_event_qs.filter(start_date__month=selected_month)
 
-        def list_events_sets(qs):
+        def list_events_sets(qs, decreasing_order=True):
             events_without_sets = qs.filter(event_set__isnull=True)
+            order = "-start_date" if decreasing_order else "start_date"
             first_events_of_each_set = (
                 qs.filter(event_set__isnull=False)
-                .order_by("event_set_id", "-start_date")
+                .order_by("event_set_id", order, "name")
                 .distinct("event_set_id")
             )
             return events_without_sets.union(first_events_of_each_set).order_by(
-                "-start_date", "name"
+                order, "name"
             )
 
         def events_to_sets(qs, type="past"):
@@ -1368,6 +1564,10 @@ class Event(models.Model):
                     .filter(event_set_id__in=events_set_ids, privacy=PRIVACY_PUBLIC)
                     .order_by("-start_date", "name")
                 )
+                if not club:
+                    all_events_w_set = all_events_w_set.filter(
+                        list_on_routechoices_com=True
+                    )
                 if type == "live":
                     all_events_w_set = all_events_w_set.filter(
                         start_date__lte=now(), end_date__gte=now()
@@ -1376,7 +1576,7 @@ class Event(models.Model):
                     all_events_w_set = all_events_w_set.filter(
                         start_date__gt=now(),
                         start_date__lte=now() + timedelta(hours=24),
-                    )
+                    ).order_by("start_date", "name")
                 else:
                     all_events_w_set = all_events_w_set.filter(end_date__lt=now())
                     if selected_year:
@@ -1410,6 +1610,7 @@ class Event(models.Model):
                     events.append(
                         {
                             "name": event_set.name,
+                            "data": event_set,
                             "events": events_by_set[event_set.id],
                             "fake": False,
                         }
@@ -1425,7 +1626,7 @@ class Event(models.Model):
             all_live_events = list_events_sets(live_events_qs)
             live_events = events_to_sets(all_live_events, type="live")
 
-            all_upcoming_events = list_events_sets(upcoming_events_qs)
+            all_upcoming_events = list_events_sets(upcoming_events_qs, False)
             upcoming_events = events_to_sets(all_upcoming_events, type="upcoming")
         else:
             live_events = upcoming_events = cls.objects.none()
@@ -1468,10 +1669,14 @@ class Event(models.Model):
         return f"{self.club.nice_url}{self.slug}/export"
 
     @property
+    def duration(self):
+        return self.end_date - self.start_date
+
+    @property
     def shortcut(self):
         shortcut_url = getattr(settings, "SHORTCUT_BASE_URL", None)
         if shortcut_url:
-            return f"{shortcut_url}{self.aid}"
+            return f"{shortcut_url}{self.club.slug}/{self.slug}"
         return None
 
     @property
@@ -1512,6 +1717,10 @@ class Event(models.Model):
             qs = qs.exclude(id=self.id)
         if qs.exists():
             errors.append("Event with this Club and Slug already exists.")
+        elif EventSet.objects.filter(
+            club_id=self.club_id, create_page=True, slug__iexact=self.slug
+        ).exists():
+            errors.append("Event Set with this Club and Slug already exists.")
         if errors:
             raise ValidationError(errors)
         super().validate_unique(exclude)
@@ -1519,69 +1728,83 @@ class Event(models.Model):
     def invalidate_cache(self):
         t0 = time.time()
         cache_interval = EVENT_CACHE_INTERVAL
-        for cache_prefix in ("live", "archived"):
+        for cache_suffix in ("live", "archived"):
             cache_ts = int(
-                t0 // (cache_interval if cache_prefix == "live" else 7 * 24 * 3600)
+                t0 // (cache_interval if cache_suffix == "live" else 7 * 24 * 3600)
             )
-            cache_key = f"{cache_prefix}_event_data:{self.aid}:{cache_ts}"
+            cache_key = f"event:{self.aid}:data:{cache_ts}:{cache_suffix}"
             cache.delete(cache_key)
-            cache_key = f"{cache_prefix}_event_data:{self.aid}:{cache_ts - 1}"
+            cache_key = f"event:{self.aid}:data:{cache_ts - 1}:{cache_suffix}"
             cache.delete(cache_key)
 
     @property
     def has_notice(self):
         return hasattr(self, "notice")
 
-    def thumbnail(self, msg=""):
+    def thumbnail(self, display_logo, mime="image/jpeg"):
         if self.start_date > now() or not self.map:
+            cache_key = (
+                f"map:{self.aid}:blank:thumbnail:{display_logo}"
+                f":{self.club.modification_date}:{mime}"
+            )
+            cached = cache.get(cache_key)
+            if cached:
+                return cached
             img = Image.new("RGB", (1200, 630), "WHITE")
         else:
             raster_map = self.map
-            orig = raster_map.image.open("rb").read()
+            cache_key = (
+                f"map:{self.aid}:{raster_map.hash}:thumbnail:{display_logo}"
+                f":{self.club.modification_date}:{mime}"
+            )
+            cached = cache.get(cache_key)
+            if cached:
+                return cached
+            orig = raster_map.data
             img = Image.open(BytesIO(orig)).convert("RGBA")
             white_bg_img = Image.new("RGBA", img.size, "WHITE")
             white_bg_img.paste(img, (0, 0), img)
             img = white_bg_img.convert("RGB")
+            img = img.rotate(round(self.map.rotation / 90) * 90)
+            img_width, img_height = img.size
+            is_portrait = img_height > img_width
+            if is_portrait:
+                w = int(img_width / 3)
+            else:
+                w = int(img_height / 3)
+            h = w * 21 / 40
             img = img.transform(
                 (1200, 630),
                 Image.QUAD,
                 (
-                    int(raster_map.width) / 2 - 300,
-                    int(raster_map.height) / 2 - 158,
-                    int(raster_map.width) / 2 - 300,
-                    int(raster_map.height) / 2 + 157,
-                    int(raster_map.width) / 2 + 300,
-                    int(raster_map.height) / 2 + 157,
-                    int(raster_map.width) / 2 + 300,
-                    int(raster_map.height) / 2 - 158,
+                    int(img_width / 2) - w,
+                    int(img_height / 2) - h,
+                    int(img_width / 2) - w,
+                    int(img_height / 2) + h,
+                    int(img_width / 2) + w,
+                    int(img_height / 2) + h,
+                    int(img_width / 2) + w,
+                    int(img_height / 2) - h,
                 ),
             )
-        font = ImageFont.truetype("routechoices/AtkinsonHyperlegible-Bold.ttf", 60)
-        draw = ImageDraw.Draw(img)
-        w, h = draw.textsize(msg, font=font)
-        x = int((1200 - w) / 2)
-        logo = None
-        y = int((630 - h) / 2)
-        if self.club.logo:
-            logo_b = self.club.logo.open("rb").read()
-            logo = Image.open(BytesIO(logo_b))
-        elif not self.club.domain:
-            logo = Image.open("routechoices/watermark.png")
-        if logo:
-            logo_f = logo.resize((250, 250), Image.ANTIALIAS)
-            img.paste(logo_f, (int((1200 - 250) / 2), int((630 - 250) / 2)), logo_f)
-            y = 480
-        color = "black"
-        shadow = "white"
-        if msg:
-            draw.text((x - 1, y - 1), msg, font=font, fill=shadow)
-            draw.text((x + 1, y - 1), msg, font=font, fill=shadow)
-            draw.text((x - 1, y + 1), msg, font=font, fill=shadow)
-            draw.text((x + 1, y + 1), msg, font=font, fill=shadow)
-            draw.text((x, y), msg, font=font, fill=color)
+        if display_logo:
+            logo = None
+            if self.club.logo:
+                logo_b = self.club.logo.open("rb").read()
+                logo = Image.open(BytesIO(logo_b))
+            elif not self.club.domain:
+                logo = Image.open("routechoices/watermark.png")
+            if logo:
+                logo_f = logo.resize((250, 250), Image.LANCZOS)
+                img.paste(logo_f, (int((1200 - 250) / 2), int((630 - 250) / 2)), logo_f)
         buffer = BytesIO()
-        img.save(buffer, "JPEG", quality=80)
+        img.save(
+            buffer,
+            mime[6:].upper(),
+            quality=(40 if mime in ("image/avif", "image/jxl") else 80),
+        )
         data_out = buffer.getvalue()
+        cache.set(cache_key, data_out, 31 * 24 * 3600)
         return data_out
 
 
@@ -1619,6 +1842,7 @@ class Device(models.Model):
         default=random_device_id,
         max_length=12,
         unique=True,
+        db_index=True,
         validators=[
             validate_slug,
         ],
@@ -1710,14 +1934,14 @@ class Device(models.Model):
     def locations_series(self):
         if not self.locations_encoded:
             return []
-        return gps_encoding.decode_data(self.locations_encoded)
+        return gps_data_codec.decode(self.locations_encoded)
 
     @locations_series.setter
     def locations_series(self, locations_list):
         sorted_locations = list(
             sorted(locations_list, key=itemgetter(LOCATION_TIMESTAMP_INDEX))
         )
-        self.locations_encoded = gps_encoding.encode_data(sorted_locations)
+        self.locations_encoded = gps_data_codec.encode(sorted_locations)
         self.update_cached_data()
 
     @property
@@ -1757,19 +1981,19 @@ class Device(models.Model):
             self._last_location_latitude = None
             self._last_location_longitude = None
 
-    def get_locations_between_dates(self, from_date, end_date, /, *, encoded=False):
+    def get_locations_between_dates(self, from_date, end_date, /, *, encode=False):
         from_ts = from_date.timestamp()
         end_ts = end_date.timestamp()
         locs = self.locations_series
         from_idx = bisect.bisect_left(locs, from_ts, key=itemgetter(0))
         end_idx = bisect.bisect_right(locs, end_ts, key=itemgetter(0))
         locs = locs[from_idx:end_idx]
-        if not encoded:
-            return len(locs), locs
-        result = gps_encoding.encode_data(locs)
-        return len(locs), result
+        if not encode:
+            return locs, len(locs)
+        encoded_locs = gps_data_codec.encode(locs)
+        return encoded_locs, len(locs)
 
-    def add_locations(self, loc_array, /, *, save=True, push_forward=True):
+    def add_locations(self, loc_array, /, *, save=True):
         if len(loc_array) == 0:
             return
         new_pts = []
@@ -1811,38 +2035,20 @@ class Device(models.Model):
             self.save()
 
         new_pts = list(sorted(new_pts, key=itemgetter(LOCATION_TIMESTAMP_INDEX)))
-        archived_events_affected = self.get_events(
-            from_time=epoch_to_datetime(new_pts[0][LOCATION_TIMESTAMP_INDEX]),
-            to_time=epoch_to_datetime(new_pts[-1][LOCATION_TIMESTAMP_INDEX]),
+        archived_events_affected = self.get_events_between_dates(
+            epoch_to_datetime(new_pts[0][LOCATION_TIMESTAMP_INDEX]),
+            epoch_to_datetime(new_pts[-1][LOCATION_TIMESTAMP_INDEX]),
             should_be_ended=True,
         )
         for archived_event_affected in archived_events_affected:
             archived_event_affected.invalidate_cache()
-        if push_forward:
-            try:
-                competitor = self.get_competitor(load_event=True)
-                if competitor:
-                    event = competitor.event
-                    if event.is_live:
-                        event_id = event.aid
-                        new_data = gps_encoding.encode_data(new_pts)
-                        client = redis.from_url(settings.REDIS_URL)
-                        client.publish(
-                            f"routechoices_event_data:{event_id}",
-                            json.dumps(
-                                {"competitor": competitor.aid, "data": new_data}
-                            ),
-                        )
-            except Exception:
-                pass
 
-    def add_location(self, timestamp, lat, lon, /, *, save=True, push_forward=True):
+    def add_location(self, timestamp, lat, lon, /, *, save=True):
         self.add_locations(
             [
                 (timestamp, lat, lon),
             ],
             save=save,
-            push_forward=push_forward,
         )
 
     @property
@@ -1880,7 +2086,7 @@ class Device(models.Model):
             )
             prev_t = t
 
-        updated_encoded = gps_encoding.encode_data(updated_locations_list)
+        updated_encoded = gps_data_codec.encode(updated_locations_list)
         if self.locations_encoded != updated_encoded:
             self.locations_series = updated_locations_list
             if save:
@@ -1888,7 +2094,7 @@ class Device(models.Model):
 
     @property
     def last_location(self):
-        if self.location_count == 0:
+        if not self._location_count:
             return None
         return (
             self._last_location_datetime.timestamp(),
@@ -1898,7 +2104,7 @@ class Device(models.Model):
 
     @property
     def last_location_timestamp(self):
-        if self.location_count == 0:
+        if self._location_count == 0:
             return None
         return self.last_location[LOCATION_TIMESTAMP_INDEX]
 
@@ -1906,39 +2112,34 @@ class Device(models.Model):
     def last_location_datetime(self):
         return self._last_location_datetime
 
-    def get_competitor(self, at=None, load_event=False):
-        if not at:
-            at = now()
+    def get_competitors_at_date(self, at, /, *, load_events=False):
         qs = (
             self.competitor_set.all()
             .filter(start_time__lte=at, event__end_date__gte=at)
-            .order_by("-start_time")
+            .annotate(min_start=Min("start_time"))
+            .filter(start_time=F("min_start"))
         )
-        if load_event:
+        if load_events:
             qs = qs.select_related("event")
-        return qs.first()
+        return qs
 
-    def get_event(self, at=None):
-        if at is None:
-            at = now()
-        c = self.get_competitor(at=at, load_event=True)
-        if c:
-            return c.event
-        return None
+    def get_events_at_date(self, at):
+        competitors = self.get_competitors_at_date(at, load_events=True)
+        return {c.event for c in competitors}
 
-    def get_events(self, from_time, to_time, should_be_ended=False):
+    def get_events_between_dates(self, from_date, to_date, /, *, should_be_ended=False):
         qs = (
             self.competitor_set.all()
             .filter(
-                event__end_date__gte=from_time,
-                start_time__lte=to_time,
+                event__end_date__gte=from_date,
+                start_time__lte=to_date,
             )
             .select_related("event")
             .order_by("start_time")
         )
         if should_be_ended:
             qs = qs.filter(event__end_date__lt=now())
-        return set([c.event for c in qs])
+        return {c.event for c in qs}
 
     def get_last_competitor(self, load_event=False):
         qs = self.competitor_set.all().order_by("-start_time")
@@ -1965,41 +2166,45 @@ class Device(models.Model):
         lat = None
         lon = None
 
-        competitor = self.get_competitor(at=now(), load_event=True)
+        competitors = self.get_competitors_at_date(now(), load_events=True)
 
         if self.last_location:
             _, lat, lon = self.last_location
 
-        if not competitor:
+        if not competitors:
             return self.aid, lat, lon, None
-
-        event = competitor.event
-        to_emails = set()
-        if event.emergency_contact:
-            to_emails.add(event.emergency_contact)
-        else:
-            club = event.club
-            for user in club.admins.all():
-                to_email = EmailAddress.objects.get_primary(user) or user.email
-                to_emails.add(to_email)
-
-        if to_emails:
-            msg = EmailMessage(
-                (
-                    f"Routechoices.com - SOS from competitor {competitor.name}"
-                    f" in event {event.name} [{now().isoformat()}]"
-                ),
-                (
-                    f"Competitor {competitor.name} has triggered the SOS button"
-                    f" of his GPS tracker during event {event.name}\r\n\r\n"
-                    f"His latest known location is latitude, longitude: {lat}, {lon}"
-                ),
-                settings.DEFAULT_FROM_EMAIL,
-                list(to_emails),
-            )
-            msg.send()
-
-        return self.aid, lat, lon, list(to_emails)
+        all_to_emails = set()
+        for competitor in competitors:
+            event = competitor.event
+            to_emails = set()
+            if event.emergency_contact:
+                to_emails.add(event.emergency_contact)
+            else:
+                club = event.club
+                admin_ids = list(club.admins.all().values_list("id", flat=True))
+                to_emails = list(
+                    EmailAddress.objects.filter(
+                        primary=True, user__in=admin_ids
+                    ).values_list("email", flat=True)
+                )
+            if to_emails:
+                msg = EmailMessage(
+                    (
+                        f"Routechoices.com - SOS from competitor {competitor.name}"
+                        f" in event {event.name} [{now().isoformat()}]"
+                    ),
+                    (
+                        f"Competitor {competitor.name} has triggered the SOS button"
+                        f" of his GPS tracker during event {event.name}\r\n\r\n"
+                        "His latest known location is latitude, longitude: "
+                        f"{lat}, {lon}"
+                    ),
+                    settings.DEFAULT_FROM_EMAIL,
+                    list(to_emails),
+                )
+                msg.send()
+            all_to_emails = all_to_emails.union(to_emails)
+        return self.aid, lat, lon, list(all_to_emails)
 
 
 class DeviceArchiveReference(models.Model):
@@ -2020,6 +2225,7 @@ class ImeiDevice(models.Model):
         validators=[
             validate_imei,
         ],
+        db_index=True,
     )
     device = models.OneToOneField(
         Device, related_name="physical_device", on_delete=models.CASCADE
@@ -2047,7 +2253,7 @@ class DeviceClubOwnership(models.Model):
     class Meta:
         unique_together = (("device", "club"),)
         verbose_name = "Device ownership"
-        verbose_name_plural = "Devices ownership"
+        verbose_name_plural = "Device ownerships"
 
 
 class Competitor(models.Model):
@@ -2056,11 +2262,13 @@ class Competitor(models.Model):
         max_length=12,
         editable=False,
         unique=True,
+        db_index=True,
     )
     event = models.ForeignKey(
         Event,
         related_name="competitors",
         on_delete=models.CASCADE,
+        db_index=True,
     )
     device = models.ForeignKey(
         Device,
@@ -2086,83 +2294,95 @@ class Competitor(models.Model):
     def save(self, *args, **kwargs):
         if not self.start_time:
             self.start_time = self.event.start_date
-        next_event = self.event
-        next_event.invalidate_cache()
+        new_event = self.event
+        new_event.invalidate_cache()
         current_self = None
         if self.pk:
             current_self = Competitor.objects.get(id=self.id)
-            next_device = self.device
-            next_start = self.start_time
-            prev_device = current_self.device
-            prev_start = current_self.start_time
-            prev_event = current_self.event
+            new_device = self.device
+            new_start = self.start_time
+            old_device = current_self.device
+            old_start = current_self.start_time
+            old_event = current_self.event
             # We proceed the future device before save so we can properly fetch
             # data as they are before update
-            if next_device and next_device != prev_device:
-                if prev_start != next_start:
-                    events_between_prev_and_next_starts = next_device.get_events(
-                        from_time=min(prev_start, next_start),
-                        to_time=max(prev_start, next_start),
+            if new_device and new_device != old_device:
+                if new_start != old_start:
+                    from_time = min(old_start, new_start)
+                    to_time = max(old_start, new_start)
+                    events_between_old_and_new_starts = (
+                        new_device.get_events_between_dates(from_time, to_time)
                     )
-                    for event_in_range in events_between_prev_and_next_starts:
+                    for event_in_range in events_between_old_and_new_starts:
                         event_in_range.invalidate_cache()
                 else:
-                    event_at_start = next_device.get_event(at=next_start)
-                    if event_at_start:
-                        event_at_start.invalidate_cache()
+                    events_at_start = new_device.get_events_at_date(new_start)
+                    for event_then in events_at_start:
+                        event_then.invalidate_cache()
         super().save(*args, **kwargs)
         if current_self:
-            if prev_event != next_event:
-                prev_event.invalidate_cache()
+            if old_event != new_event:
+                old_event.invalidate_cache()
             # We proceed the old device after save so we can properly fetch
             # data as they are after update
-            if prev_device:
-                if prev_start != next_start:
-                    events_between_prev_and_next_starts = prev_device.get_events(
-                        from_time=min(prev_start, next_start),
-                        to_time=max(prev_start, next_start),
+            if old_device:
+                if new_start != old_start:
+                    from_time = min(old_start, new_start)
+                    to_time = max(old_start, new_start)
+                    events_between_old_and_new_starts = (
+                        old_device.get_events_between_dates(from_time, to_time)
                     )
-                    for event_in_range in events_between_prev_and_next_starts:
+                    for event_in_range in events_between_old_and_new_starts:
                         event_in_range.invalidate_cache()
                 else:
-                    event_at_start = prev_device.get_event(at=next_start)
-                    if event_at_start:
-                        event_at_start.invalidate_cache()
+                    events_at_start = old_device.get_events_at_date(new_start)
+                    for event_then in events_at_start:
+                        event_then.invalidate_cache()
+
+    @property
+    def start_datetime(self):
+        from_date = self.event.start_date
+        if self.start_time:
+            from_date = self.start_time
+        return from_date
 
     @property
     def started(self):
-        return self.start_time > now()
+        return self.start_datetime > now()
+
+    @property
+    def end_datetime(self):
+        from_date = self.start_datetime
+        end_time = min(now(), self.event.end_date)
+        next_competitor_start_time = (
+            self.device.competitor_set.filter(
+                start_time__gt=from_date, start_time__lt=end_time
+            )
+            .order_by("start_time")
+            .values_list("start_time", flat=True)
+            .first()
+        )
+        if next_competitor_start_time:
+            end_time = next_competitor_start_time
+        return end_time
 
     @cached_property
     def locations(self):
         if not self.device:
             return []
-
-        from_date = self.event.start_date
-        if self.start_time:
-            from_date = self.start_time
-
-        next_competitor_start_time = (
-            self.device.competitor_set.filter(start_time__gt=from_date)
-            .order_by("start_time")
-            .values_list("start_time", flat=True)
-            .first()
+        locs, _ = self.device.get_locations_between_dates(
+            self.start_datetime, self.end_datetime
         )
-
-        to_date = min(now(), self.event.end_date)
-        if next_competitor_start_time:
-            to_date = min(next_competitor_start_time, to_date)
-        _, locs = self.device.get_locations_between_dates(from_date, to_date)
         return locs
 
     @property
     def encoded_data(self):
-        result = gps_encoding.encode_data(self.locations)
+        result = gps_data_codec.encode(self.locations)
         return result
 
     @property
     def gpx(self):
-        current_site = get_current_site(None)
+        current_site = get_current_site()
         gpx = gpxpy.gpx.GPX()
         gpx.creator = current_site.name
         gpx_track = gpxpy.gpx.GPXTrack()
@@ -2195,9 +2415,12 @@ class Competitor(models.Model):
 def invalidate_competitor_event_cache(sender, instance, **kwargs):
     instance.event.invalidate_cache()
     if instance.device:
-        new_event_for_device = instance.device.get_event(at=instance.start_time)
-        if new_event_for_device:
-            new_event_for_device.invalidate_cache()
+        start_time = instance.start_time
+        if not start_time:
+            start_time = instance.event.start_date
+        new_events_for_device = instance.device.get_events_at_date(start_time)
+        for event in new_events_for_device:
+            event.invalidate_cache()
 
 
 class SpotFeed(models.Model):
@@ -2245,3 +2468,14 @@ class TcpDeviceCommand(models.Model):
 
     def __str__(self):
         return f"Command for imei {self.target}"
+
+
+class IndividualDonator(models.Model):
+    name = models.CharField(max_length=255)
+    email = models.EmailField(max_length=255)
+    upgraded = models.BooleanField(default=False)
+    upgraded_date = models.DateTimeField(blank=True, null=True)
+    order_id = models.CharField(max_length=200, blank=True, default="")
+
+    def __str__(self):
+        return self.name

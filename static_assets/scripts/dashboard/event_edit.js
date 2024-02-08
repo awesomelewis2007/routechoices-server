@@ -50,23 +50,9 @@ function onAddedCompetitorRow(row) {
 
   u(row)
     .find('input[id$="-start_time"]')
-    .each(function (el) {
-      var localTimeDisplay = u(el).parent().find(".local_time");
-      localTimeDisplay.before(
-        '<button class="set_time_now_btn btn btn-info btn-sm py-1 px-2 float-end"><i class="fa-solid fa-clock"></i> Set Now</button>'
-      );
-      u(el)
-        .parent()
-        .find(".set_time_now_btn")
-        .on("click", function (e) {
-          e.preventDefault();
-          var target = u(e.target)
-            .parent()
-            .parent()
-            .find('input[id$="-start_time"]');
-          target.val(dayjs().utc().format("YYYY-MM-DD HH:mm:ss"));
-          target.trigger("change");
-        });
+    .each((el) => {
+      makeTimeFieldClearable(el);
+      makeFieldNowable(el);
     });
 
   u(el).attr("autocomplete", "off");
@@ -77,6 +63,171 @@ function onAddedCompetitorRow(row) {
   u(el).on("change", function (e) {
     showLocalTime(e.target);
   });
+}
+
+function clearEmptyCompetitorRows() {
+  u(".formset_row").each(function (e) {
+    if (
+      u(e)
+        .find("input")
+        .filter(function (el) {
+          return u(el).attr("type") != "hidden" && el.value != "";
+        }).length == 0
+    ) {
+      u(e).find(".delete-row").first().click();
+    }
+  });
+}
+
+function addCompetitor(name, shortName, startTime, deviceId) {
+  u(".add-competitor-btn").first().click();
+  var inputs = u(u(".formset_row").last()).find("input").nodes;
+  if (startTime) {
+    inputs[5].value = dayjs(startTime).utc().format("YYYY-MM-DD HH:mm:ss");
+    u(inputs[5]).trigger("change");
+  }
+  inputs[2].value = name;
+  inputs[3].value = shortName;
+  if (deviceId) {
+    var myDeviceSelectInput = lastDeviceSelectInput;
+    reqwest({
+      url: window.local.apiBaseUrl + "search/device?q=" + deviceId,
+      method: "get",
+      type: "json",
+      withCredentials: true,
+      crossOrigin: true,
+      success: (function (line) {
+        return function (res) {
+          if (res.results.length == 1) {
+            var r = res.results[0];
+            myDeviceSelectInput.addOption(r);
+            myDeviceSelectInput.setValue(r[seletizeOptions.valueField]);
+          }
+        };
+      })(),
+    });
+  }
+}
+
+function displayRoutechoicesListedOption(value, first) {
+  if (value === "public") {
+    u("#id_list_on_routechoices_com").parent().parent().show();
+    if (!first) {
+      u("#id_list_on_routechoices_com").first().checked = true;
+    }
+  } else {
+    u("#id_list_on_routechoices_com").parent().parent().hide();
+    u("#id_list_on_routechoices_com").first().checked = false;
+  }
+}
+
+function onIofXMLLoaded(e) {
+  var file = e.target.files[0];
+  if (file) {
+    var reader = new FileReader();
+    reader.onload = function (evt) {
+      var txt = evt.target.result;
+      const parser = new DOMParser();
+      const parsedXML = parser.parseFromString(txt, "text/xml");
+      var isResultFile =
+        parsedXML.getElementsByTagName("ResultList").length == 1;
+      var isStartFile = parsedXML.getElementsByTagName("StartList").length == 1;
+      if (!isResultFile && !isStartFile) {
+        swal({
+          title: "Error!",
+          text: "Neither a start list or a result list",
+          type: "error",
+          confirmButtonText: "OK",
+        });
+        u("#iof_input").val("");
+        return;
+      }
+      var classes = [];
+      var selector = document.getElementById("iof_class_input");
+      selector.innerHTML = "";
+      var ii = 1;
+      for (c of parsedXML.getElementsByTagName("Class")) {
+        var id = ii;
+        var name = c.getElementsByTagName("Name")[0].textContent;
+        classes.push({ id, name });
+        var opt = document.createElement("option");
+        opt.value = id;
+        opt.appendChild(document.createTextNode(name));
+        selector.appendChild(opt);
+        ii++;
+      }
+      u("#iof-step-1").addClass("d-none");
+      u("#iof-step-2").removeClass("d-none");
+      u("#iof-class-cancel-btn").on("click", function (e) {
+        e.preventDefault();
+        u("#iof-step-2").addClass("d-none");
+        u("#iof-step-1").removeClass("d-none");
+        u("#iof_input").val("");
+      });
+      u("#iof-class-submit-btn").off("click");
+      u("#iof-class-submit-btn").on("click", function (e) {
+        e.preventDefault();
+        var classId = u("#iof_class_input").val();
+        var suffix = isResultFile ? "Result" : "Start";
+
+        clearEmptyCompetitorRows();
+        var ii = 1;
+        for (c of parsedXML.getElementsByTagName("Class" + suffix)) {
+          if (ii === parseInt(classId, 10)) {
+            for (p of c.getElementsByTagName("Person" + suffix)) {
+              var startTime = null;
+              var name = null;
+              var shortName = null;
+              try {
+                startTime = p
+                  .getElementsByTagName(suffix)[0]
+                  .getElementsByTagName("StartTime")[0].textContent;
+              } catch (e) {
+                console.log(e);
+              }
+              try {
+                name =
+                  p
+                    .getElementsByTagName("Person")[0]
+                    .getElementsByTagName("Given")[0].textContent +
+                  " " +
+                  p
+                    .getElementsByTagName("Person")[0]
+                    .getElementsByTagName("Family")[0].textContent;
+                shortName =
+                  p
+                    .getElementsByTagName("Person")[0]
+                    .getElementsByTagName("Given")[0].textContent[0] +
+                  "." +
+                  p
+                    .getElementsByTagName("Person")[0]
+                    .getElementsByTagName("Family")[0].textContent;
+              } catch (e) {
+                console.log(e);
+              }
+              if (name) {
+                addCompetitor(name, shortName, startTime);
+              }
+            }
+            u(".add-competitor-btn").first().click();
+          }
+          ii++;
+        }
+        u("#iof-step-2").addClass("d-none");
+        u("#iof-step-1").removeClass("d-none");
+        u("#iof_input").val("");
+      });
+    };
+    reader.onerror = function () {
+      swal({
+        title: "Error!",
+        text: "Could not parse this file",
+        type: "error",
+        confirmButtonText: "OK",
+      });
+    };
+    reader.readAsText(file, "UTF-8");
+  }
 }
 
 function onCsvParsed(result) {
@@ -112,47 +263,11 @@ function onCsvParsed(result) {
       confirmButtonText: "OK",
     });
     return;
-  } // clear empty lines
-  u(".formset_row").each(function (e) {
-    if (
-      u(e)
-        .find("input")
-        .filter(function (el) {
-          return u(el).attr("type") != "hidden" && el.value != "";
-        }).length == 0
-    ) {
-      u(e).find(".delete-row").first().click();
-    }
-  });
+  }
+  clearEmptyCompetitorRows();
   result.data.forEach(function (l) {
-    u(".add-competitor-btn").first().click();
     if (l.length != 1) {
-      var inputs = u(u(".formset_row").last()).find("input").nodes;
-      if (l.length > 3) {
-        var myDeviceSelectInput = lastDeviceSelectInput;
-        reqwest({
-          url: window.local.apiBaseUrl + "search/device?q=" + l[3],
-          method: "get",
-          type: "json",
-          withCredentials: true,
-          crossOrigin: true,
-          success: (function (line) {
-            return function (res) {
-              if (res.results.length == 1) {
-                var r = res.results[0];
-                myDeviceSelectInput.addOption(r);
-                myDeviceSelectInput.setValue(r[seletizeOptions.valueField]);
-              }
-            };
-          })(),
-        });
-      }
-      if (l[2]) {
-        inputs[5].value = dayjs(l[2]).utc().format("YYYY-MM-DD HH:mm:ss");
-        u(inputs[5]).trigger("change");
-      }
-      inputs[2].value = l[0];
-      inputs[3].value = l[1];
+      addCompetitor(l[0], l[1], l[2], l?.[3]);
     }
   });
   u(".add-competitor-btn").first().click();
@@ -160,13 +275,13 @@ function onCsvParsed(result) {
 
 function showLocalTime(el) {
   var val = u(el).val();
-  var local = "";
   if (val) {
-    local =
-      dayjs(val).utc(true).local().format("YYYY-MM-DD HH:mm:ss") +
-      " Local time";
+    var local = dayjs(val).utc(true).local().format("YYYY-MM-DD HH:mm:ss");
+    local += local === "Invalid Date" ? "" : " Local time";
+    u(el).parent().find(".local_time").text(local);
+  } else {
+    u(el).parent().find(".local_time").html("&ZeroWidthSpace;");
   }
-  u(el).parent().find(".local_time").text(local);
 }
 
 (function () {
@@ -188,25 +303,7 @@ function showLocalTime(el) {
 
   var newSlug = u("#id_name").val() == "";
   var slugEdited = false;
-  u("#id_slug")
-    .parent()
-    .find(".form-text")
-    .text("")
-    .append(
-      '<button class="randomize_btn btn btn-info btn-sm float-end py-1 px-2"><i class="fa-solid fa-shuffle"></i> Randomize</button>'
-    );
-  u(".randomize_btn").on("click", function (e) {
-    e.preventDefault();
-    var target = u(e.target).parent().parent().find(".form-control");
-    var result = "";
-    var characters = "23456789abcdefghijkmnpqrstuvwxyz";
-    var charactersLength = characters.length;
-    for (var i = 0; i < 6; i++) {
-      result += characters.charAt(Math.floor(Math.random() * charactersLength));
-    }
-    target.val(result);
-    target.trigger("blur");
-  });
+  makeFieldRandomizable("#id_slug");
   u("#id_name").on("keyup", function (e) {
     if (!slugEdited) {
       var value = e.target.value;
@@ -243,7 +340,7 @@ function showLocalTime(el) {
         url: window.local.apiBaseUrl + "event-set",
         method: "post",
         data: {
-          club_id: window.local.clubId,
+          club_slug: window.local.clubSlug,
           name: input,
         },
         type: "json",
@@ -273,7 +370,6 @@ function showLocalTime(el) {
       },
     };
     var val = u(el).val();
-    new tempusDominus.TempusDominus(el, options);
     if (
       val &&
       /^\d{4}-\d{2}-\d{2}/.test(val) &&
@@ -285,21 +381,22 @@ function showLocalTime(el) {
     } else {
       u(el).val("");
     }
+    new tempusDominus.TempusDominus(el, options);
   });
   u('label[for$="-DELETE"]').parent(".form-group").hide();
   $(".formset_row").formset({
     addText: '<i class="fa-solid fa-circle-plus"></i> Add Competitor',
     addCssClass: "btn btn-info add-competitor-btn",
-    deleteText:
-      '<button class="btn btn-danger"><i class="fa-solid fa-xmark"></i></button>',
+    deleteCssClass: "btn btn-danger delete-row",
+    deleteText: '<i class="fa-solid fa-xmark"></i>',
     prefix: "competitors",
     added: onAddedCompetitorRow,
   });
   $(".extra_map_formset_row").formset({
     addText: '<i class="fa-solid fa-circle-plus"></i> Add Map',
     addCssClass: "btn btn-info add-map-btn",
-    deleteText:
-      '<button class="btn btn-danger"><i class="fa-solid fa-xmark"></i></button>',
+    deleteCssClass: "btn btn-danger delete-row",
+    deleteText: '<i class="fa-solid fa-xmark"></i>',
     prefix: "map_assignations",
     formCssClass: "extra_map_formset_row",
   });
@@ -322,30 +419,19 @@ function showLocalTime(el) {
 
   var originalEventStart = u("#id_start_date").val();
   var competitorsStartTimeElsWithSameStartAsEvents = u(
-    ".competitor_table .datetimepicker"
+    ".competitor-table .datetimepicker"
   ).filter(function (el) {
     return originalEventStart !== "" && u(el).val() == originalEventStart;
   }).nodes;
   u("#csv_input").on("change", function (e) {
     Papa.parse(e.target.files[0], { complete: onCsvParsed });
   });
+
+  u("#iof_input").on("change", onIofXMLLoaded);
+  u(".competitor-table .datetimepicker").each(makeTimeFieldClearable);
   u(".datetimepicker").each(function (el) {
     u(el).attr("autocomplete", "off");
-
-    var localTimeDisplay = u(el).parent().find(".local_time");
-    localTimeDisplay.before(
-      '<button class="set_time_now_btn btn btn-info btn-sm float-end py-1 px-2"><i class="fa-solid fa-clock"></i> Set Now</button>'
-    );
-    u(el)
-      .parent()
-      .find(".set_time_now_btn")
-      .on("click", function (e) {
-        e.preventDefault();
-        var target = u(e.target).parent().parent().find(".datetimepicker");
-        target.val(dayjs().utc().format("YYYY-MM-DD HH:mm:ss"));
-        target.trigger("change");
-      });
-
+    makeFieldNowable(el);
     showLocalTime(el);
     el.addEventListener(tempusDominus.Namespace.events.change, function (e) {
       var elId = u(e.target).attr("id");
@@ -380,36 +466,93 @@ function showLocalTime(el) {
 
   var tailLength = u("#id_tail_length").addClass("d-none").val();
   u('[for="id_tail_length"]').text("Tail length (Hours, Minutes, Seconds)");
-  var tailLengthInput = u(
-    '<div class="row g-3">' +
-      '<div class="col-auto"><input type="number" min="0" max="9999" class="form-control tailLengthControl" id="tailLengthHoursInput" value="' +
-      Math.floor(tailLength / 3600) +
-      '" style="width:100px"/></div><div class="col-auto" style="vertical-align: bottom;margin:1.3em -.7em">:</div>' +
-      '<div class="col-auto"><input type="number" min="0" max="59" class="form-control tailLengthControl" id="tailLengthMinutesInput" value="' +
-      (Math.floor(tailLength / 60) % 60) +
-      '" style="width:75px"/></div><div class="col-auto" style="vertical-align: bottom;margin:1.3em -.7em">:</div>' +
-      '<div class="col-auto"><input type="number" min="0" max="59" class="form-control tailLengthControl" id="tailLengthSecondsInput" value="' +
-      (tailLength % 60) +
-      '" style="width:75px"/></div>' +
-      "</div>"
-  );
-  u("#id_tail_length").after(tailLengthInput);
-  u(tailLengthInput)
+
+  var tailLenFormDiv = u("<div/>").addClass("row", "g-1");
+
+  var hourInput = u("<input/>")
+    .addClass("d-inline-block")
+    .addClass("form-control", "tailLengthControl")
+    .css({ width: "85px" })
+    .attr({
+      type: "number",
+      min: "0",
+      max: "9999",
+      name: "hours",
+    })
+    .val(Math.floor(tailLength / 3600));
+
+  var hourDiv = u("<div/>")
+    .addClass("col-auto")
+    .append(hourInput)
+    .append("<span> : </span>");
+
+  var minuteInput = u("<input/>")
+    .addClass("d-inline-block")
+    .addClass("form-control", "tailLengthControl")
+    .css({ width: "65px" })
+    .attr({
+      type: "number",
+      min: "0",
+      max: "59",
+      name: "minutes",
+    })
+    .val(Math.floor(tailLength / 60) % 60);
+
+  var minuteDiv = u("<div/>")
+    .addClass("col-auto")
+    .append(minuteInput)
+    .append("<span> : </span>");
+
+  var secondInput = u("<input/>")
+    .addClass("d-inline-block")
+    .addClass("form-control", "tailLengthControl")
+    .css({ width: "65px" })
+    .attr({
+      type: "number",
+      min: "0",
+      max: "59",
+      name: "seconds",
+    })
+    .val(tailLength % 60);
+
+  var secondDiv = u("<div/>").addClass("col-auto").append(secondInput);
+
+  tailLenFormDiv.append(hourDiv).append(minuteDiv).append(secondDiv);
+
+  u("#id_tail_length").after(tailLenFormDiv);
+  u(tailLenFormDiv)
     .find(".tailLengthControl")
     .on("input", function (e) {
-      var h = parseInt(u("#tailLengthHoursInput").val() || 0);
-      var m = parseInt(u("#tailLengthMinutesInput").val() || 0);
-      var s = parseInt(u("#tailLengthSecondsInput").val() || 0);
+      var commonDiv = u(e.target).parent().parent();
+      var hourInput = commonDiv.find('input[name="hours"]');
+      var minInput = commonDiv.find('input[name="minutes"]');
+      var secInput = commonDiv.find('input[name="seconds"]');
+      var h = parseInt(hourInput.val() || 0);
+      var m = parseInt(minInput.val() || 0);
+      var s = parseInt(secInput.val() || 0);
       var v = 3600 * h + 60 * m + s;
       if (isNaN(v)) {
         return;
       }
-      tailLength = Math.max(0, v);
+      var tailLength = Math.max(0, v);
       u("#id_tail_length").val(tailLength);
-      u("#tailLengthHoursInput").val(Math.floor(tailLength / 3600));
-      u("#tailLengthMinutesInput").val(Math.floor((tailLength / 60) % 60));
-      u("#tailLengthSecondsInput").val(Math.floor(tailLength % 60));
+      hourInput.val(Math.floor(tailLength / 3600));
+      minInput.val(Math.floor((tailLength / 60) % 60));
+      secInput.val(Math.floor(tailLength % 60));
     });
 
   u("#id_backdrop_map").parent().before("<hr/><h3>Maps</h3>");
+  u("#id_privacy").on("change", function (e) {
+    displayRoutechoicesListedOption(e.target.value, false);
+  });
+  displayRoutechoicesListedOption(u("#id_privacy").val(), true);
+
+  u("form").on("submit", function (e) {
+    u("#submit-btn").attr({ disabled: true });
+    u("button[name='save_continue']").addClass("disabled");
+    u(e.submitter)
+      .find("i")
+      .removeClass("fa-floppy-disk")
+      .addClass("fa-spinner fa-spin");
+  });
 })();

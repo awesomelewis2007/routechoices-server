@@ -4,6 +4,7 @@ from django.http.response import HttpResponseBadRequest
 from django.shortcuts import render
 from django.utils.timezone import now
 from django.views.decorators.http import condition
+from rest_framework import status
 
 from routechoices.core.models import (
     PRIVACY_PRIVATE,
@@ -12,7 +13,7 @@ from routechoices.core.models import (
     MapAssignation,
 )
 from routechoices.lib.globalmaptiles import GlobalMercator
-from routechoices.lib.helpers import safe64encodedsha
+from routechoices.lib.helpers import get_best_image_mime, safe64encodedsha
 from routechoices.lib.streaming_response import StreamingHttpRangeResponse
 
 GLOBAL_MERCATOR = GlobalMercator()
@@ -28,15 +29,15 @@ def common_wms(function):
             return HttpResponseBadRequest("Service must be WMS")
 
         if get_params.get("request", "").lower() == "getmap":
-            http_accept = request.META.get("HTTP_ACCEPT", "")
-            better_mime = None
-            if "image/avif" in http_accept.split(","):
-                better_mime = "image/avif"
-            elif "image/webp" in http_accept.split(","):
-                better_mime = "image/webp"
-
             asked_mime = get_params.get("format", "image/png").lower()
-            if asked_mime in ("image/apng", "image/png", "image/webp", "image/avif"):
+            better_mime = get_best_image_mime(request)
+            if asked_mime in (
+                "image/apng",
+                "image/png",
+                "image/webp",
+                "image/avif",
+                "image/jxl",
+            ):
                 img_mime = asked_mime
                 if img_mime == "image/apng":
                     img_mime = "image/png"
@@ -169,12 +170,15 @@ def wms_service(request):
             headers=headers,
         )
 
-    elif get_params.get("request", "").lower() == "getcapabilities":
+    if get_params.get("request", "").lower() == "getcapabilities":
         max_xy = GLOBAL_MERCATOR.latlon_to_meters({"lat": 89.9, "lon": 180})
         min_xy = GLOBAL_MERCATOR.latlon_to_meters({"lat": -89.9, "lon": -180})
 
         events = (
-            Event.objects.filter(privacy=PRIVACY_PUBLIC)
+            Event.objects.filter(
+                privacy=PRIVACY_PUBLIC,
+                list_on_routechoices_com=True,
+            )
             .filter(start_date__lte=now())
             .select_related("club", "map")
             .prefetch_related(
@@ -213,4 +217,5 @@ def wms_service(request):
             {"layers": layers, "min_xy": min_xy, "max_xy": max_xy},
             content_type="text/xml",
         )
-    return HttpResponse(status=501)
+
+    return HttpResponse(status=status.HTTP_501_NOT_IMPLEMENTED)

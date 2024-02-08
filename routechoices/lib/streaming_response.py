@@ -5,6 +5,7 @@ from wsgiref.util import FileWrapper
 
 import magic
 from django.http import StreamingHttpResponse
+from rest_framework import status
 
 range_re = re.compile(r"bytes\s*=\s*(\d+)\s*-\s*(\d*)", re.I)
 
@@ -23,31 +24,36 @@ class RangeFileWrapper:
     def __iter__(self):
         return self
 
-    def next(self):
+    def __next__(self):
         if self.remaining is None:
             # If remaining is None, we're reading the entire file.
             data = self.filelike.read(self.blksize)
             if data:
                 return data
             raise StopIteration()
-        else:
-            if self.remaining <= 0:
-                raise StopIteration()
-            data = self.filelike.read(min(self.remaining, self.blksize))
-            if not data:
-                raise StopIteration()
-            self.remaining -= len(data)
-            return data
+        if self.remaining <= 0:
+            raise StopIteration()
+        data = self.filelike.read(min(self.remaining, self.blksize))
+        if not data:
+            raise StopIteration()
+        self.remaining -= len(data)
+        return data
 
 
 def StreamingHttpRangeResponse(request, data, **kwargs):
-    range_header = request.META.get("HTTP_RANGE", "").strip()
-    range_match = range_re.match(range_header)
     size = len(data)
     content_type = kwargs.pop("content_type", None)
     if not content_type:
         content_type = magic.from_buffer(data, mime=True) or "application/octet-stream"
-    fileIO = BytesIO(data)
+
+    range_header = request.META.get("HTTP_RANGE", "").strip()
+    range_match = range_re.match(range_header)
+
+    if request.method == "HEAD":
+        fileIO = BytesIO(b"")
+    else:
+        fileIO = BytesIO(data)
+
     if range_match:
         first_byte, last_byte = range_match.groups()
         first_byte = int(first_byte) if first_byte else 0
@@ -56,8 +62,12 @@ def StreamingHttpRangeResponse(request, data, **kwargs):
             last_byte = size - 1
         length = last_byte - first_byte + 1
         resp = StreamingHttpResponse(
-            RangeFileWrapper(fileIO, offset=first_byte, length=length),
-            status=206,
+            (
+                FileWrapper(fileIO)
+                if request.method == "HEAD"
+                else RangeFileWrapper(fileIO, offset=first_byte, length=length)
+            ),
+            status=status.HTTP_206_PARTIAL_CONTENT,
             content_type=content_type,
             **kwargs,
         )

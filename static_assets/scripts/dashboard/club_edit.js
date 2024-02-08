@@ -1,6 +1,34 @@
 (function () {
   u("#id_slug").parent().find(".form-label").text("Domain Prefix");
 
+  var currentLogo = u(u("#id_logo").parent().find("div").find("div").first())
+    .find("a")
+    .attr("href");
+  if (currentLogo) {
+    u(u("#id_logo").parent().find("div").find("div").first())
+      .find("a")
+      .html(
+        '<br/><img alt="Current Logo" height="50" width="50" src="' +
+          window.local.clubNiceUrl +
+          'logo"/>'
+      );
+  }
+
+  var currentBanner = u(
+    u("#id_banner").parent().find("div").find("div").first()
+  )
+    .find("a")
+    .attr("href");
+  if (currentBanner) {
+    u(u("#id_banner").parent().find("div").find("div").first())
+      .find("a")
+      .html(
+        '<br/><img alt="Current Banner" height="210" width="400" src="' +
+          window.local.clubNiceUrl +
+          'banner"/>'
+      );
+  }
+
   var newSlug = u("#id_name").val() == "";
   var slugEdited = false;
   u("#id_name").on("keyup", function (e) {
@@ -57,9 +85,9 @@
   if (inviteBtn) {
     u("#id_admins-ts-label").parent().after(inviteBtn);
   }
-  var submitForm = document.getElementById("change_form");
+  var submitForm = u("#change_form");
   if (submitForm) {
-    submitForm.addEventListener("submit", function confirmResetStats(e) {
+    submitForm.on("submit", function confirmResetStats(e) {
       if (
         window.local.clubSlug &&
         u("#id_slug").val() !== window.local.clubSlug
@@ -76,8 +104,8 @@
           },
           function (isConfirmed) {
             if (isConfirmed) {
-              submitForm.removeEventListener("submit", confirmResetStats);
-              submitForm.submit();
+              u(e.target).off("submit");
+              e.target.submit();
             } else {
               u("#id_slug").val(window.local.clubSlug);
             }
@@ -86,4 +114,5 @@
       }
     });
   }
+  makeTextAreasAutoGrow();
 })();

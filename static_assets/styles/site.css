@@ -21,6 +21,14 @@
 }
 
 @font-face {
+  font-family: "Twemoji Country Flags";
+  unicode-range: U+1F1E6-1F1FF, U+1F3F4, U+E0062-E0063, U+E0065, U+E0067,
+    U+E006C, U+E006E, U+E0073-E0074, U+E0077, U+E007F;
+  src: url("../fonts/twemoji-country-flags.woff2") format("woff2");
+  font-display: swap;
+}
+
+@font-face {
   font-family: "Atkinson Hyperlegible";
   font-style: normal;
   font-weight: 700;
@@ -97,7 +105,10 @@ body {
   -webkit-flex-direction: column;
   height: 100%;
   padding-top: 0px;
-  background-color: #f8f9fa;
+}
+
+.flags-polyfill {
+  font-family: "Twemoji Country Flags", var(--bs-body-font-family);
 }
 
 .site-name {
@@ -112,48 +123,6 @@ body {
   min-height: 200px;
   padding-bottom: 30px;
   padding-top: 15px;
-}
-
-.bg_video {
-  position: fixed;
-  top: 50%;
-  left: 50%;
-  min-width: 100%;
-  min-height: 100%;
-  width: auto;
-  height: auto;
-  z-index: -100;
-  transform: translate(-50%, -50%);
-  -webkit-transform: translate(-50%, -50%);
-  transition: 1s opacity;
-  object-fit: contain;
-  vertical-align: baseline;
-  background: transparent url("../background.jpg") 50% 50% / cover no-repeat;
-}
-
-.video_cover {
-  position: fixed;
-  top: 0;
-  left: 0;
-  min-width: 100%;
-  min-height: 100%;
-  width: auto;
-  height: auto;
-  z-index: -100;
-  background: rgb(20, 30, 50, 0.5);
-}
-
-.video_text_overlay {
-  color: #eee;
-}
-
-.frontpage_text {
-  font-family: "Atkinson Hyperlegible", sans-serif;
-}
-
-.frontpage_text_bold {
-  font-family: "Atkinson Hyperlegible", sans-serif;
-  font-weight: 700;
 }
 
 #myFooter {
@@ -176,7 +145,7 @@ body {
 }
 
 #myFooter h5 {
-  font-size: 18px;
+  font-size: 1.2rem;
   color: white;
   font-weight: bold;
   margin-top: 30px;
@@ -200,7 +169,7 @@ body {
 }
 
 #myFooter .second-bar a {
-  font-size: 22px;
+  font-size: 1.7rem;
   color: #9fa3a9;
   padding: 10px;
   transition: 0.2s;
@@ -228,7 +197,7 @@ body {
 }
 
 .loginBtn {
-  margin-bottom: 0;
+  margin-bottom: 10px;
 }
 
 @media screen and (max-width: 767px) {
@@ -238,10 +207,6 @@ body {
 
   #myFooter .info {
     text-align: center;
-  }
-
-  .loginBtn {
-    margin-bottom: 5px;
   }
 }
 
@@ -256,7 +221,7 @@ body {
 
 #myFooter .second-bar .logo a {
   color: white;
-  font-size: 28px;
+  font-size: 1.7rem;
   float: left;
   font-weight: bold;
   line-height: 68px;
@@ -270,7 +235,7 @@ body {
 
 #myFooter .second-bar .logosmall a {
   color: white;
-  font-size: 17px;
+  font-size: 1.15rem;
   float: left;
   font-weight: bold;
   line-height: 35px;
@@ -291,21 +256,11 @@ body {
   color: #13967d;
 }
 
-.wms256 .leaflet-tile-container img {
-  width: 256.5px !important;
-  height: 256.5px !important;
-}
-
-.wms512 .leaflet-tile-container img {
-  width: 512.5px !important;
-  height: 512.5px !important;
-}
-
 .padded-multiline {
   line-height: 1.4;
   padding: 2px 0;
-  margin: 20px auto 0.5em 15px;
-  max-width: calc(100% - 35px);
+  margin: 0 0 0.5em 10px;
+  max-width: calc(100% - 20px);
 }
 
 .padded-multiline span {
@@ -319,38 +274,51 @@ body {
   -webkit-box-decoration-break: clone;
 }
 
-.image-banner2 {
-  background-image: url("../img/banner2.jpg"); /* fallback for non image-set browser */
-  background-image: -webkit-image-set(
-    url("../img/banner2.avif") 1x /* type("image/avif") */,
-    url("../img/banner2.webp") 1x /* type("image/webp") */,
-    url("../img/banner2.jpg") 1x /* type("image/png") */
-  );
-  background-image: image-set(
-    url("../img/banner2.avif") 1x,
-    url("../img/banner2.webp") 1x,
-    url("../img/banner2.jpg") 1x
-  );
-  margin: 0;
-  padding: 0;
-  background-repeat: no-repeat;
-  background-size: cover;
-  background-position: center;
-}
-
 .dark-link {
-  color: var(--bs-gray-900);
+  color: var(--bs-body-color);
 }
 
 .dark-link:hover {
-  color: var(--bs-gray-700);
+  color: var(--bs-secondary-color);
 }
 
 .if-navbar-toggled {
   display: block;
 }
+
 .if-navbar-not-toggled {
   display: none;
+}
+
+.navbar-expand-lg .dashboard-navbar-link {
+  margin-top: 5px;
+  margin-bottom: 5px;
+}
+
+.theme-selector {
+  margin: 6px 0px;
+  padding: 0;
+  border: 0;
+  height: 1.5rem;
+  width: 1rem;
+  background: #111 !important;
+}
+
+.theme-selector > svg {
+  width: 1rem;
+  height: 1rem;
+  fill: #fff;
+  padding: 0;
+  margin: 0;
+}
+.base-svgs {
+  display: none;
+}
+.navbarTooltip {
+  z-index: 110001 !important;
+  --bs-tooltip-bg: #fff;
+  --bs-tooltip-color: #000;
+  pointer-events: none;
 }
 
 @media (min-width: 576px) {
@@ -374,11 +342,23 @@ body {
 }
 
 @media (min-width: 992px) {
+  .theme-selector {
+    margin-left: 7px;
+    width: 1.5rem;
+  }
   .navbar-expand-lg .if-navbar-toggled {
     display: none;
   }
   .navbar-expand-lg .if-navbar-not-toggled {
     display: block;
+  }
+  .navbar-expand-lg .dashboard-navbar-link {
+    margin-bottom: 0;
+    margin-top: 0;
+  }
+
+  .navbar-expand-lg .loginBtn {
+    margin-bottom: 0;
   }
 }
 
@@ -403,4 +383,44 @@ body {
 #django-messages .alert {
   border-radius: 0;
   margin-bottom: 0;
+}
+
+[data-bs-theme="light"] {
+  color-scheme: light;
+  --rc-color-from-trans: rgba(255, 255, 255, 1);
+  --rc-color-to-trans: rgba(255, 255, 255, 0.3);
+  --rc-color-to-trans2: rgba(255, 255, 255, 0.75);
+  --rc-gradient-filter: rgba(0, 0, 0, 0);
+}
+
+[data-bs-theme="dark"] {
+  color-scheme: dark;
+  --rc-color-from-trans: rgba(0, 0, 0, 1);
+  --rc-color-to-trans: rgba(0, 0, 0, 0.3);
+  --rc-color-to-trans2: rgba(0, 0, 0, 0.75);
+  --rc-gradient-filter: rgba(0, 0, 0, 0.3);
+}
+
+.sweet-alert {
+  background-color: var(--bs-body-bg);
+}
+
+.tempus-dominus-widget {
+  background-color: var(--bs-secondary-bg) !important;
+}
+.tempus-dominus-widget .arrow::before {
+  background-color: var(--bs-secondary-bg) !important;
+}
+.tempus-dominus-widget .toolbar div:hover {
+  background: var(--bs-dark-bg-subtle) !important;
+}
+.tempus-dominus-widget .date-container-decades div:not(.no-highlight):hover,
+.tempus-dominus-widget .date-container-years div:not(.no-highlight):hover,
+.tempus-dominus-widget .date-container-months div:not(.no-highlight):hover,
+.tempus-dominus-widget .date-container-days div:not(.no-highlight):hover,
+.tempus-dominus-widget .time-container-clock div:not(.no-highlight):hover,
+.tempus-dominus-widget .time-container-hour div:not(.no-highlight):hover,
+.tempus-dominus-widget .time-container-minute div:not(.no-highlight):hover,
+.tempus-dominus-widget .time-container-second div:not(.no-highlight):hover {
+  background: var(--bs-dark-bg-subtle) !important;
 }

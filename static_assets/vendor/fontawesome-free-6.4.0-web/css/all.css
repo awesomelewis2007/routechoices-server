@@ -681,6 +681,54 @@ readers do not read off random characters that represent icons */
   content: "\f1ab";
 }
 
+.fa-arrows-rotate::before {
+  content: "\f021";
+}
+
+.fa-thumbs-up::before {
+  content: "\f164";
+}
+
+.fa-file-arrow-up::before {
+  content: "\f574";
+}
+
+.fa-tag::before {
+  content: "\f02b";
+}
+
+.fa-table-columns::before {
+  content: "\f0db";
+}
+
+.fa-arrow-right-from-bracket::before {
+  content: "\f08b";
+}
+
+.fa-pencil::before {
+  content: "\f303";
+}
+
+.fa-spinner::before {
+  content: "\f110";
+}
+
+.fa-paper-plane::before {
+  content: "\f1d8";
+}
+
+.fa-box-archive::before {
+  content: "\f187";
+}
+
+.fa-bell::before {
+  content: "\f0f3";
+}
+
+.fa-hand::before {
+  content: "\f256";
+}
+
 .sr-only,
 .fa-sr-only {
   position: absolute;

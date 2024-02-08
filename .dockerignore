@@ -5,6 +5,8 @@ static/*
 .github/*
 cypress/*
 log/*
+letsencrypt/*
+tmp/*
 logs/*
 .gitignore
 cypress.json
@@ -19,3 +21,11 @@ yarn.lock
 *.sqlite3
 yarn.lock
 .git/*
+.coverage
+coverage.xml
+docker/*
+__pycache__/*
+.ruff_cache/*
+cache/*
+nginx/*
+var/*

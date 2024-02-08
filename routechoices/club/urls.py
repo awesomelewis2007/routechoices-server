@@ -11,11 +11,13 @@ sitemaps = {
 urlpatterns = [
     re_path(r"^$", views.club_view, name="club_view"),
     re_path(r"^logo/?$", views.club_logo, name="club_logo"),
+    re_path(r"^banner/?$", views.club_banner, name="club_banner"),
     re_path(
         r"(?P<icon_name>favicon\.ico|apple-touch-icon\.png|icon-192\.png|icon-512\.png)",
         views.club_favicon,
         name="club_favicon",
     ),
+    re_path(r"^thumbnail/?$", views.club_thumbnail, name="club_thumbnail"),
     path("manifest.json", views.manifest, name="manifest"),
     path("robots.txt", views.robots_txt, name="robots.txt"),
     path(
@@ -32,11 +34,6 @@ urlpatterns = [
         r"\.well-known/acme-challenge/(?P<challenge>.+)$",
         views.acme_challenge,
         name="acme_challenge",
-    ),
-    re_path(
-        r"events/(?P<slug>[0-9a-zA-Z_-]+)/?$",
-        views.event_set_view,
-        name="event_set_view",
     ),
     re_path(
         r"(?P<slug>[0-9a-zA-Z_-]+)/export/?$",
@@ -57,6 +54,11 @@ urlpatterns = [
         r"(?P<slug>[0-9a-zA-Z_-]+)/contribute/?$",
         views.event_contribute_view,
         name="event_contribute_view",
+    ),
+    re_path(
+        r"^(?P<slug>[0-9a-zA-Z_-]+)/thumbnail/?$",
+        views.event_map_thumbnail,
+        name="event_map_thumbnail",
     ),
     re_path(r"(?P<slug>[0-9a-zA-Z_-]+)/?$", views.event_view, name="event_view"),
 ]

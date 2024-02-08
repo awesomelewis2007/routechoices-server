@@ -169,7 +169,6 @@ function selectizeDeviceInput() {
   });
 
   if (u("#registration-form").nodes.length) {
-    u("#warning-if-open-registration").removeClass("d-none");
     u("#registration-form").on("submit", function (e) {
       e.preventDefault();
       var formData = new FormData(e.target);
@@ -225,6 +224,11 @@ function selectizeDeviceInput() {
           u("#warning-if-device-id").removeClass("d-none");
         }
       });
+    }
+    if (u("#upload-form").nodes.length) {
+      u("#id_device_id-ts-label").text(
+        "Device ID (Leave blank if you want to upload a GPX File)"
+      );
     }
   }
 

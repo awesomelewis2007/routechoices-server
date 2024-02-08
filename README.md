@@ -1,4 +1,4 @@
-[![circleci](https://circleci.com/gh/routechoices/routechoices-server.svg?style=shield)](https://circleci.com/gh/routechoices/routechoices-server) [![pre-commit.ci status](https://results.pre-commit.ci/badge/github/routechoices/routechoices-server/master.svg)](https://results.pre-commit.ci/latest/github/routechoices/routechoices-server/master)
+[![circleci](https://circleci.com/gh/routechoices/routechoices-server.svg?style=shield)](https://circleci.com/gh/routechoices/routechoices-server) [![pre-commit.ci status](https://results.pre-commit.ci/badge/github/routechoices/routechoices-server/master.svg)](https://results.pre-commit.ci/latest/github/routechoices/routechoices-server/master) [![codecov](https://codecov.io/gh/routechoices/routechoices-server/branch/master/graph/badge.svg?token=OZLCAY280V)](https://codecov.io/gh/routechoices/routechoices-server)
 
 
 Routechoices server
@@ -13,7 +13,6 @@ It includes:
   - A public API
   - A TCP server for listening to dedicated trackers
   - A WMS server for serving events maps
-  - A SSE server to push data from tracker to clients without delay
   - A full-fledged admin interface for owners
 
 This project rely on the Django and the Tornado Web python frameworks.

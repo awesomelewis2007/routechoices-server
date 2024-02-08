@@ -1,19 +1,25 @@
-from django.conf import settings
-from django.contrib.sites.models import Site
 from django.contrib.syndication.views import Feed
 from django.utils.timezone import now
 from django_hosts.resolvers import reverse
 
+from routechoices.club.feeds import RssXslFeed
 from routechoices.core.models import PRIVACY_PUBLIC, Event
+from routechoices.lib.helpers import get_current_site
+
+
+class SiteRssFeed(RssXslFeed):
+    xsl_path = "/static/xsl/site-feed.xsl"
 
 
 class LiveEventsFeed(Feed):
+    feed_type = SiteRssFeed
+
     def title(self):
-        site = Site.objects.get(id=settings.SITE_ID)
+        site = get_current_site()
         return f"GPS Tracking Events on {site.name}"
 
     def description(self):
-        site = Site.objects.get(id=settings.SITE_ID)
+        site = get_current_site()
         return f"Watch live or later the GPS Tracking Events on {site.name}"
 
     def link(self):
@@ -24,6 +30,7 @@ class LiveEventsFeed(Feed):
             Event.objects.select_related("club")
             .filter(
                 privacy=PRIVACY_PUBLIC,
+                list_on_routechoices_com=True,
             )
             .filter(start_date__lte=now())
         )

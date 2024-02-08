@@ -29,11 +29,7 @@ from routechoices.core.models import (
     MapAssignation,
     Notice,
 )
-from routechoices.lib.helpers import (
-    check_cname_record,
-    check_txt_record,
-    get_aware_datetime,
-)
+from routechoices.lib.helpers import check_cname_record, get_aware_datetime
 from routechoices.lib.validators import domain_validator, validate_nice_slug
 
 
@@ -52,10 +48,37 @@ class UserForm(ModelForm):
         return username
 
 
+class RequestInviteForm(Form):
+    def __init__(self, user, *args, **kwargs):
+        self.user = user
+        super().__init__(*args, **kwargs)
+
+    club = ModelChoiceField(
+        label="Club",
+        help_text="Enter the club you want to be added as admin",
+        queryset=Club.objects.filter(forbid_invite_request=False),
+    )
+
+    def clean_club(self):
+        club = self.cleaned_data["club"]
+        if self.user in club.admins.all():
+            raise ValidationError("You are already an admin of this club.")
+        return club
+
+
 class ClubForm(ModelForm):
     class Meta:
         model = Club
-        fields = ["name", "slug", "admins", "website", "logo", "description"]
+        fields = [
+            "name",
+            "slug",
+            "admins",
+            "forbid_invite_request",
+            "website",
+            "logo",
+            "banner",
+            "description",
+        ]
 
     def clean_slug(self):
         slug = self.cleaned_data["slug"].lower()
@@ -89,9 +112,60 @@ class ClubForm(ModelForm):
             raise ValidationError("Domain prefix already registered.")
         return slug
 
+    def clean_banner(self):
+        banner = self.cleaned_data["banner"]
+        if not banner or "banner" not in self.changed_data:
+            return banner
+        w, h = get_image_dimensions(banner)
+        if w < 600 or h < 315:
+            raise ValidationError("The image is too small, minimum 600x315 pixels")
+        fn = banner.name
+        with Image.open(banner.file) as image:
+            rgba_img = image.convert("RGBA")
+            r = 1200 / 630
+            if w < h * r:
+                target_w = 1200
+                r2 = w / target_w
+                target_h = int(target_w / r)
+                resized_image = rgba_img.resize((target_w, int(h / r2)))
+                required_loss = resized_image.size[1] - target_h
+                cropped_image = resized_image.crop(
+                    box=(
+                        0,
+                        required_loss / 2,
+                        1200,
+                        resized_image.size[1] - required_loss / 2,
+                    )
+                )
+            else:
+                target_h = 630
+                r2 = h / target_h
+                target_w = int(target_h * r)
+                resized_image = rgba_img.resize((int(w / r2), target_h))
+                required_loss = resized_image.size[0] - target_w
+                cropped_image = resized_image.crop(
+                    box=(
+                        required_loss / 2,
+                        0,
+                        resized_image.size[0] - required_loss / 2,
+                        630,
+                    )
+                )
+            out_buffer = BytesIO()
+            cropped_image.resize((1200, 630))
+            white_bg_img = Image.new("RGBA", (1200, 630), "WHITE")
+            white_bg_img.paste(cropped_image, (0, 0), cropped_image)
+            img = white_bg_img.convert("RGB")
+            params = {
+                "dpi": (72, 72),
+            }
+            img.save(out_buffer, "WEBP", **params)
+            f_new = File(out_buffer, name=fn)
+            return f_new
+
     def clean_logo(self):
         logo = self.cleaned_data["logo"]
-        if not logo:
+        if not logo or "logo" not in self.changed_data:
             return logo
         w, h = get_image_dimensions(logo)
         minimum = 128
@@ -155,10 +229,6 @@ class ClubDomainForm(ModelForm):
         domain = self.cleaned_data["domain"]
         if domain == "":
             return domain
-        if not check_txt_record(domain):
-            raise ValidationError(
-                f"TXT record for '{domain}' has not been set properly."
-            )
         if not check_cname_record(domain):
             raise ValidationError(
                 f"CNAME record for '{domain}' has not been set properly."
@@ -183,16 +253,22 @@ class DeviceForm(Form):
 class MapForm(ModelForm):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.fields[
-            "image"
-        ].help_text = "Image of map as a PNG, JPEG, GIF, WEBP, or PDF file"
+        self.fields["image"].help_text = (
+            "Image of map as a PNG, JPEG, GIF, WEBP, or PDF file"
+        )
 
     class Meta:
         model = Map
         fields = ["name", "image", "corners_coordinates"]
 
+    def clean_corners_coordinates(self):
+        cc = self.cleaned_data["corners_coordinates"]
+        return ",".join([f"{round(float(c), 5)}" for c in cc.split(",")])
+
     def clean_image(self):
         f_orig = self.cleaned_data["image"]
+        if "image" not in self.changed_data:
+            return f_orig
         fn = f_orig.name
         with Image.open(f_orig.file) as image:
             rgba_img = image.convert("RGBA")
@@ -218,7 +294,7 @@ class EventSetForm(ModelForm):
 
     class Meta:
         model = EventSet
-        fields = ["name", "create_page", "slug", "list_secret_events"]
+        fields = ["name", "create_page", "slug", "description", "list_secret_events"]
 
     def validate_unique(self):
         exclude = self._get_validation_exclusions()
@@ -249,6 +325,7 @@ class EventForm(ModelForm):
             "open_registration",
             "allow_route_upload",
             "privacy",
+            "list_on_routechoices_com",
             "send_interval",
             "tail_length",
             "emergency_contact",
@@ -292,10 +369,10 @@ class EventForm(ModelForm):
             for i in range(start_count_maps, start_count_maps + num_maps):
                 if (
                     self.data.get(f"map_assignations-{i}-map")
+                    and self.data.get(f"map_assignations-{i}-DELETE") != "on"
                     and int(self.data.get(f"map_assignations-{i}-map")) == raster_map.id
                 ):
                     raise ValidationError("Map assigned more than once in this event")
-
         return raster_map
 
     def clean_map_title(self):
@@ -305,6 +382,7 @@ class EventForm(ModelForm):
         for i in range(start_count_maps, start_count_maps + num_maps):
             if (
                 self.data.get(f"map_assignations-{i}-title")
+                and self.data.get(f"map_assignations-{i}-DELETE") != "on"
                 and self.data.get(f"map_assignations-{i}-title") == map_title
             ):
                 raise ValidationError("Map title given more than once in this event")
@@ -331,20 +409,21 @@ class ExtraMapForm(ModelForm):
             raise ValidationError(
                 "Extra maps can be set only if the main map field is set first"
             )
+
         if int(self.data.get("map")) == self.cleaned_data.get("map").id:
             raise ValidationError("Map assigned more than once in this event")
 
+        map_occurence = 0
         num_maps = int(self.data.get("map_assignations-TOTAL_FORMS"))
         start_count_maps = int(self.data.get("map_assignations-MIN_NUM_FORMS"))
-        map_with_same_id = 0
         for i in range(start_count_maps, start_count_maps + num_maps):
             if (
                 self.data.get(f"map_assignations-{i}-map")
-                and int(self.data.get(f"map_assignations-{i}-map"))
-                == self.cleaned_data.get("map").id
+                and self.data.get(f"map_assignations-{i}-DELETE") != "on"
+                and int(self.data.get(f"map_assignations-{i}-map")) == raster_map.id
             ):
-                map_with_same_id += 1
-                if map_with_same_id > 1:
+                map_occurence += 1
+                if map_occurence > 1:
                     raise ValidationError("Map assigned more than once in this event")
         return raster_map
 
@@ -354,16 +433,17 @@ class ExtraMapForm(ModelForm):
         if main_map_title and main_map_title == map_title:
             raise ValidationError("Map title given more than once in this event")
 
+        title_occurence = 0
         num_maps = int(self.data.get("map_assignations-TOTAL_FORMS"))
         start_count_maps = int(self.data.get("map_assignations-MIN_NUM_FORMS"))
-        map_with_same_title = 0
         for i in range(start_count_maps, start_count_maps + num_maps):
             if (
                 self.data.get(f"map_assignations-{i}-title")
+                and self.data.get(f"map_assignations-{i}-DELETE") != "on"
                 and self.data.get(f"map_assignations-{i}-title") == map_title
             ):
-                map_with_same_title += 1
-                if map_with_same_title > 1:
+                title_occurence += 1
+                if title_occurence > 1:
                     raise ValidationError(
                         "Map title given more than once in this event"
                     )
@@ -401,7 +481,12 @@ class CompetitorForm(ModelForm):
                 event_end = orig_event.end_date
         else:
             event_end = orig_event.end_date
-        if start and (event_start > start or start > event_end):
+        if (
+            start
+            and event_start
+            and event_end
+            and (event_start > start or start > event_end)
+        ):
             raise ValidationError(
                 "Competitor start time should be during the event time"
             )

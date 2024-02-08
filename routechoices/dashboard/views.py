@@ -3,12 +3,14 @@ import os
 import tempfile
 import zipfile
 from copy import deepcopy
+from io import StringIO
 
 import gpxpy
 import requests
 from allauth.account import app_settings as allauth_settings
 from allauth.account.adapter import get_adapter
 from allauth.account.forms import default_token_generator
+from allauth.account.models import EmailAddress
 from allauth.account.signals import password_changed, password_reset
 from allauth.account.utils import user_username
 from allauth.account.views import EmailView
@@ -19,14 +21,13 @@ from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.models import User
-from django.contrib.sites.shortcuts import get_current_site
 from django.core.files import File
 from django.core.paginator import Paginator
 from django.db.models import Case, Q, Value, When
 from django.dispatch import receiver
 from django.http import Http404, HttpResponseRedirect
 from django.shortcuts import get_object_or_404, redirect, render
-from django.urls import reverse, reverse_lazy
+from django.urls import reverse
 from django.utils.decorators import method_decorator
 from django.utils.timezone import now
 from kagi.views.backup_codes import BackupCodesView
@@ -36,13 +37,13 @@ from user_sessions.views import SessionDeleteOtherView
 from invitations.forms import InviteForm
 from routechoices.api.views import serve_from_s3
 from routechoices.core.models import (
-    IS_DB_POSTGRES,
     Club,
     Competitor,
     Device,
     DeviceClubOwnership,
     Event,
     EventSet,
+    ImeiDevice,
     Map,
     Notice,
 )
@@ -56,43 +57,62 @@ from routechoices.dashboard.forms import (
     ExtraMapFormSet,
     MapForm,
     NoticeForm,
+    RequestInviteForm,
     UploadGPXForm,
     UploadKmzForm,
     UploadMapGPXForm,
     UserForm,
 )
-from routechoices.lib.helpers import short_random_key
+from routechoices.lib.helpers import (
+    get_current_site,
+    set_content_disposition,
+    short_random_key,
+)
 from routechoices.lib.kmz import extract_ground_overlay_info
+from routechoices.lib.streaming_response import StreamingHttpRangeResponse
 
 DEFAULT_PAGE_SIZE = 25
 
 
 def requires_club_in_session(function):
     def wrap(request, *args, **kwargs):
-        club = None
         obj = None
         if obj_aid := kwargs.get("event_id"):
-            obj = get_object_or_404(Event, aid=obj_aid)
+            obj = get_object_or_404(
+                Event.objects.select_related("club"),
+                aid=obj_aid,
+                club__admins=request.user,
+            )
         elif obj_aid := kwargs.get("map_id"):
-            obj = get_object_or_404(Map, aid=obj_aid)
+            obj = get_object_or_404(
+                Map.objects.select_related("club"),
+                aid=obj_aid,
+                club__admins=request.user,
+            )
         elif obj_aid := kwargs.get("event_set_id"):
-            obj = get_object_or_404(EventSet, aid=obj_aid)
+            obj = get_object_or_404(
+                EventSet.objects.select_related("club"),
+                aid=obj_aid,
+                club__admins=request.user,
+            )
+        club = None
         if obj:
-            club_id = obj.club_id
-            if request.user.is_superuser:
-                club = Club.objects.filter(id=club_id).first()
-            else:
-                club = Club.objects.filter(admins=request.user, id=club_id).first()
-        elif "dashboard_club" in request.session:
+            club = obj.club
+        if club is None and "club" in request.GET:
+            club_qp = request.GET.get("club")
+            club = Club.objects.filter(
+                slug=club_qp,
+                admins=request.user,
+            ).first()
+        if club is None and "dashboard_club" in request.session:
             session_club_aid = request.session["dashboard_club"]
-            if request.user.is_superuser:
-                club = Club.objects.filter(aid=session_club_aid).first()
-            else:
-                club = Club.objects.filter(
-                    admins=request.user, aid=session_club_aid
-                ).first()
-        if not club:
-            return redirect("dashboard:club_select_view")
+            club = Club.objects.filter(
+                aid=session_club_aid,
+                admins=request.user,
+            ).first()
+        if club is None:
+            club_select_page = reverse("dashboard:club_select_view")
+            return redirect(f"{club_select_page}?next={request.path}")
         request.session["dashboard_club"] = club.aid
         request.club = club
         return function(request, *args, **kwargs)
@@ -112,6 +132,8 @@ def home_view(request):
 @requires_club_in_session
 def club_invite_add_view(request):
     club = request.club
+    email = request.GET.get("email")
+
     if request.method == "POST":
         form = InviteForm(request.POST, club=club)
         if form.is_valid():
@@ -123,22 +145,66 @@ def club_invite_add_view(request):
             messages.success(request, "Invite sent successfully")
             return redirect("dashboard:club_view")
     else:
-        form = InviteForm()
-    return render(request, "dashboard/invite_add.html", {"club": club, "form": form})
+        form = InviteForm(initial={"email": email})
+    return render(
+        request,
+        "dashboard/invite_add.html",
+        {
+            "club": club,
+            "form": form,
+        },
+    )
+
+
+@login_required
+def club_request_invite_view(request):
+    if request.method == "POST":
+        form = RequestInviteForm(request.user, request.POST)
+        if form.is_valid():
+            club = form.cleaned_data["club"]
+            current_site = get_current_site()
+            url = build_absolute_uri(request, reverse("dashboard:club_invite_add_view"))
+            requester_email = (
+                EmailAddress.objects.filter(user_id=request.user.id, primary=True)
+                .first()
+                .email
+            )
+            context = {
+                "site_name": current_site.name,
+                "email": requester_email,
+                "club": club,
+                "send_invite_url": f"{url}?club={club.slug}&email={requester_email}",
+            }
+            club_admins_ids = list(club.admins.all().values_list("id", flat=True))
+            emails = list(
+                EmailAddress.objects.filter(
+                    user_id__in=club_admins_ids, primary=True
+                ).values_list("email", flat=True)
+            )
+            get_adapter(request).send_mail(
+                "account/email/request_invite",
+                emails,
+                context,
+            )
+            messages.success(request, "Invite requested successfully")
+            return redirect("dashboard:home_view")
+    else:
+        form = RequestInviteForm(user=request.user)
+    return render(request, "dashboard/request_invite.html", {"form": form})
 
 
 @login_required
 def club_select_view(request):
-    if request.user.is_superuser:
-        club_list = Club.objects.all()
-    else:
-        club_list = Club.objects.filter(admins=request.user)
+    club_list = Club.objects.filter(admins=request.user)
 
     paginator = Paginator(club_list, DEFAULT_PAGE_SIZE)
     page = request.GET.get("page")
+    next_page = request.GET.get("next", "")
     clubs = paginator.get_page(page)
 
-    return render(request, "dashboard/club_list.html", {"clubs": clubs})
+    return render(
+        request, "dashboard/club_list.html", {"clubs": clubs, "next": next_page}
+    )
 
 
 @login_required
@@ -179,29 +245,34 @@ def account_delete_view(request):
                 "dashboard/account_delete_confirm.html",
                 {"confirmation_valid": False},
             )
-        else:
-            temp_key = token_generator.make_token(user)
-            current_site = get_current_site(request)
-            url = build_absolute_uri(request, reverse("dashboard:account_delete_view"))
-            context = {
-                "current_site": current_site,
-                "user": user,
-                "account_deletion_url": f"{url}?confirmation_key={temp_key}",
-                "request": request,
-            }
-            if (
-                allauth_settings.AUTHENTICATION_METHOD
-                != allauth_settings.AuthenticationMethod.EMAIL
-            ):
-                context["username"] = user_username(user)
-            get_adapter(request).send_mail(
-                "account/email/account_delete", request.user.email, context
-            )
-            return render(
-                request,
-                "dashboard/account_delete.html",
-                {"sent": True},
-            )
+
+        temp_key = token_generator.make_token(user)
+        current_site = get_current_site()
+        url = build_absolute_uri(request, reverse("dashboard:account_delete_view"))
+        context = {
+            "current_site": current_site,
+            "user": user,
+            "account_deletion_url": f"{url}?confirmation_key={temp_key}",
+            "request": request,
+        }
+        if (
+            allauth_settings.AUTHENTICATION_METHOD
+            != allauth_settings.AuthenticationMethod.EMAIL
+        ):
+            context["username"] = user_username(user)
+        requester_email = (
+            EmailAddress.objects.filter(user_id=request.user.id, primary=True)
+            .first()
+            .email
+        )
+        get_adapter(request).send_mail(
+            "account/email/account_delete", requester_email, context
+        )
+        return render(
+            request,
+            "dashboard/account_delete.html",
+            {"sent": True},
+        )
     conf_key = request.GET.get("confirmation_key")
     if conf_key:
         if token_generator.check_token(user, conf_key):
@@ -235,6 +306,7 @@ def device_list_view(request):
     device_owned_list = (
         DeviceClubOwnership.objects.filter(club=club)
         .select_related("club", "device")
+        .defer("device__locations_encoded")
         .order_by(ordering_blank_last, "nickname", "device__aid")
     )
     paginator = Paginator(device_owned_list, DEFAULT_PAGE_SIZE)
@@ -246,18 +318,7 @@ def device_list_view(request):
         .filter(device_id__in=devices_listed, start_time__lt=now())
         .order_by("device_id", "-start_time")
     )
-
-    if IS_DB_POSTGRES:
-        competitors = competitors.distinct("device_id")
-    else:
-        unique_devid = set()
-        unique_competitors = []
-        for c in competitors:
-            if c.device_id not in unique_devid:
-                unique_devid.add(c.device_id)
-                unique_competitors.append(c)
-        competitors = unique_competitors
-
+    competitors = competitors.distinct("device_id")
     last_usage = {}
     for competitor in competitors:
         last_usage[competitor.device_id] = f"{competitor.event} ({competitor})"
@@ -287,8 +348,7 @@ def device_add_view(request):
             ownership.save()
             messages.success(request, "Device added successfully")
             return redirect("dashboard:device_list_view")
-        else:
-            form.fields["device"].queryset = Device.objects.none()
+        form.fields["device"].queryset = Device.objects.none()
     else:
         form = DeviceForm()
         form.fields["device"].queryset = Device.objects.none()
@@ -329,14 +389,11 @@ def club_create_view(request):
 
 @login_required
 def club_set_view(request, club_id):
-    if request.user.is_superuser:
-        club = get_object_or_404(
-            Club,
-            aid=club_id,
-        )
-    else:
-        club = get_object_or_404(Club, aid=club_id, admins=request.user)
+    club = get_object_or_404(Club, aid=club_id, admins=request.user)
     request.session["dashboard_club"] = club.aid
+    next_page = request.GET.get("next")
+    if next_page:
+        return redirect(next_page)
     return redirect("dashboard:club_view")
 
 
@@ -534,8 +591,8 @@ def map_gpx_upload_view(request):
             if not error:
                 has_points = False
                 segments = []
+                waypoints = []
 
-                points = []
                 prev_lon = None
                 offset_lon = 0
                 for point in gpx.waypoints:
@@ -546,10 +603,8 @@ def map_gpx_upload_view(request):
                         )
                         lon = point.longitude + offset_lon
                     prev_lon = lon
-                    points.append([round(point.latitude, 5), round(lon, 5)])
-                if len(points) > 1:
+                    waypoints.append([round(point.latitude, 5), round(lon, 5)])
                     has_points = True
-                    segments.append(points)
 
                 for route in gpx.routes:
                     points = []
@@ -587,10 +642,14 @@ def map_gpx_upload_view(request):
                 if not has_points:
                     error = "Could not find points in this file"
                 else:
-                    new_map = Map.from_points(segments)
-                    new_map.name = form.cleaned_data["gpx_file"].name[:-4]
-                    new_map.club = club
-                    new_map.save()
+                    try:
+                        new_map = Map.from_points(segments, waypoints)
+                    except Exception:
+                        error = "Could not generate a map from this file"
+                    else:
+                        new_map.name = form.cleaned_data["gpx_file"].name[:-4]
+                        new_map.club = club
+                        new_map.save()
             if error:
                 messages.error(request, error)
             else:
@@ -604,6 +663,19 @@ def map_gpx_upload_view(request):
         {
             "club": club,
             "form": form,
+        },
+    )
+
+
+@login_required
+@requires_club_in_session
+def map_draw_view(request):
+    club = request.club
+    return render(
+        request,
+        "dashboard/map_draw.html",
+        {
+            "club": club,
         },
     )
 
@@ -784,7 +856,7 @@ def event_set_create_view(request):
 def event_set_edit_view(request, event_set_id):
     club = request.club
     event_set = get_object_or_404(
-        EventSet.objects.all().prefetch_related("events"),
+        EventSet.objects.prefetch_related("events"),
         aid=event_set_id,
     )
 
@@ -883,29 +955,31 @@ def event_create_view(request):
             if request.POST.get("save_continue"):
                 return redirect("dashboard:event_edit_view", event_id=event.aid)
             return redirect("dashboard:event_list_view")
-        else:
-            all_devices = set()
-            for cform in formset.forms:
-                if cform.cleaned_data.get("device"):
-                    all_devices.add(cform.cleaned_data.get("device").id)
-            dev_qs = Device.objects.filter(id__in=all_devices).prefetch_related(
-                "club_ownerships"
-            )
-            dev_qs |= club.devices.all()
-            cd = [
-                {
-                    "full": (d.id, d.get_display_str(club)),
-                    "key": (d.get_nickname(club), d.get_display_str(club)),
-                }
-                for d in dev_qs
-            ]
-            cd.sort(key=lambda x: (x["key"][0] == "", x["key"]))
-            c = [
-                ["", "---------"],
-            ] + [d["full"] for d in cd]
-            for cform in formset.forms:
-                cform.fields["device"].queryset = dev_qs
-                cform.fields["device"].choices = c
+
+        all_devices_id = set()
+        for cform in formset.forms:
+            if cform.cleaned_data.get("device"):
+                all_devices_id.add(cform.cleaned_data.get("device").id)
+        dev_qs = (
+            Device.objects.filter(id__in=all_devices_id)
+            .defer("locations_encoded")
+            .prefetch_related("club_ownerships")
+        )
+        dev_qs |= club.devices.all()
+        cd = [
+            {
+                "full": (d.id, d.get_display_str(club)),
+                "key": (d.get_nickname(club), d.get_display_str(club)),
+            }
+            for d in dev_qs
+        ]
+        cd.sort(key=lambda x: (x["key"][0] == "", x["key"]))
+        c = [
+            ["", "---------"],
+        ] + [d["full"] for d in cd]
+        for cform in formset.forms:
+            cform.fields["device"].queryset = dev_qs
+            cform.fields["device"].choices = c
     else:
         form = EventForm(club=club)
         form.fields["map"].queryset = map_list
@@ -952,7 +1026,7 @@ MAX_COMPETITORS_DISPLAYED_IN_EVENT = 100
 def event_edit_view(request, event_id):
     club = request.club
     event = get_object_or_404(
-        Event.objects.all().prefetch_related("notice", "competitors"),
+        Event.objects.prefetch_related("notice", "competitors"),
         aid=event_id,
     )
 
@@ -967,9 +1041,8 @@ def event_edit_view(request, event_id):
     else:
         comp_devices_id = []
 
-    own_devices = club.devices.all()
-    own_devices_id = own_devices.values_list("id", flat=True)
-    all_devices = set(list(comp_devices_id) + list(own_devices_id))
+    own_devices_id = club.devices.all().values_list("id", flat=True)
+    all_devices_id = set(list(comp_devices_id) + list(own_devices_id))
 
     if request.method == "POST":
         # create a form instance and populate it with data from the request:
@@ -1017,27 +1090,28 @@ def event_edit_view(request, event_id):
             if request.POST.get("save_continue"):
                 return redirect("dashboard:event_edit_view", event_id=event.aid)
             return redirect("dashboard:event_list_view")
-        else:
-            for cform in formset.forms:
-                if cform.cleaned_data.get("device"):
-                    all_devices.add(cform.cleaned_data.get("device").id)
-            dev_qs = Device.objects.filter(id__in=all_devices).prefetch_related(
-                "club_ownerships"
-            )
-            cd = [
-                {
-                    "full": (d.id, d.get_display_str(club)),
-                    "key": (d.get_nickname(club), d.get_display_str(club)),
-                }
-                for d in dev_qs
-            ]
-            cd.sort(key=lambda x: (x["key"][0] == "", x["key"]))
-            c = [
-                ["", "---------"],
-            ] + [d["full"] for d in cd]
-            for cform in formset.forms:
-                cform.fields["device"].queryset = dev_qs
-                cform.fields["device"].choices = c
+        for cform in formset.forms:
+            if cform.cleaned_data.get("device"):
+                all_devices_id.add(cform.cleaned_data.get("device").id)
+        dev_qs = (
+            Device.objects.filter(id__in=all_devices_id)
+            .defer("locations_encoded")
+            .prefetch_related("club_ownerships")
+        )
+        cd = [
+            {
+                "full": (d.id, d.get_display_str(club)),
+                "key": (d.get_nickname(club), d.get_display_str(club)),
+            }
+            for d in dev_qs
+        ]
+        cd.sort(key=lambda x: (x["key"][0] == "", x["key"]))
+        c = [
+            ["", "---------"],
+        ] + [d["full"] for d in cd]
+        for cform in formset.forms:
+            cform.fields["device"].queryset = dev_qs
+            cform.fields["device"].choices = c
     else:
         form = EventForm(instance=event, club=club)
         form.fields["map"].queryset = map_list
@@ -1054,8 +1128,10 @@ def event_edit_view(request, event_id):
         if event.has_notice:
             args = {"instance": event.notice}
         notice_form = NoticeForm(**args)
-        dev_qs = Device.objects.filter(id__in=all_devices).prefetch_related(
-            "club_ownerships"
+        dev_qs = (
+            Device.objects.filter(id__in=all_devices_id)
+            .defer("locations_encoded")
+            .prefetch_related("club_ownerships")
         )
         cd = [
             {
@@ -1096,7 +1172,7 @@ COMPETITORS_PAGE_SIZE = 50
 def event_competitors_view(request, event_id):
     club = request.club
     event = get_object_or_404(
-        Event.objects.all().prefetch_related("notice", "competitors"),
+        Event.objects.prefetch_related("notice", "competitors"),
         aid=event_id,
     )
 
@@ -1120,9 +1196,8 @@ def event_competitors_view(request, event_id):
         raise Http404()
     comps = Competitor.objects.filter(id__in=[c.id for c in competitors.object_list])
     comp_devices_id = [c.device_id for c in competitors.object_list]
-    own_devices = club.devices.all()
-    own_devices_id = own_devices.values_list("id", flat=True)
-    all_devices = set(list(comp_devices_id) + list(own_devices_id))
+    own_devices_id = club.devices.all().values_list("id", flat=True)
+    all_devices_id = set(list(comp_devices_id) + list(own_devices_id))
     if request.method == "POST":
         # create a form instance and populate it with data from the request:
         event_copy = deepcopy(event)
@@ -1135,27 +1210,31 @@ def event_competitors_view(request, event_id):
             formset.save()
             messages.success(request, "Changes saved successfully")
             return redirect("dashboard:event_edit_view", event_id=event.aid)
-        else:
-            for cform in formset.forms:
-                if cform.cleaned_data.get("device"):
-                    all_devices.add(cform.cleaned_data.get("device").id)
-            dev_qs = Device.objects.filter(id__in=all_devices).prefetch_related(
-                "club_ownerships"
-            )
-            c = [
-                ["", "---------"],
-            ] + [[d.id, d.get_display_str(club)] for d in dev_qs]
-            for cform in formset.forms:
-                cform.fields["device"].queryset = dev_qs
-                cform.fields["device"].choices = c
+
+        for cform in formset.forms:
+            if cform.cleaned_data.get("device"):
+                all_devices_id.add(cform.cleaned_data.get("device").id)
+        dev_qs = (
+            Device.objects.filter(id__in=all_devices_id)
+            .defer("locations_encoded")
+            .prefetch_related("club_ownerships")
+        )
+        c = [
+            ["", "---------"],
+        ] + [[d.id, d.get_display_str(club)] for d in dev_qs]
+        for cform in formset.forms:
+            cform.fields["device"].queryset = dev_qs
+            cform.fields["device"].choices = c
     else:
         formset = CompetitorFormSet(
             instance=event,
             queryset=comps,
         )
         formset.extra = 0
-        dev_qs = Device.objects.filter(id__in=all_devices).prefetch_related(
-            "club_ownerships"
+        dev_qs = (
+            Device.objects.filter(id__in=all_devices_id)
+            .defer("locations_encoded")
+            .prefetch_related("club_ownerships")
         )
         c = [
             ["", "---------"],
@@ -1182,9 +1261,7 @@ def event_competitors_view(request, event_id):
 def event_competitors_printer_view(request, event_id):
     club = request.club
     event = get_object_or_404(
-        Event.objects.all().prefetch_related(
-            "notice", "competitors", "competitors__device"
-        ),
+        Event.objects.prefetch_related("notice", "competitors", "competitors__device"),
         aid=event_id,
     )
 
@@ -1221,32 +1298,6 @@ def event_delete_view(request, event_id):
             "event": event,
         },
     )
-
-
-@login_required
-def event_view_live(request, event_id):
-    if request.user.is_superuser:
-        event = get_object_or_404(
-            Event,
-            aid=event_id,
-            start_date__lte=now(),
-            end_date__gte=now(),
-        )
-    else:
-        club_list = Club.objects.filter(admins=request.user)
-        event = get_object_or_404(
-            Event,
-            aid=event_id,
-            club__in=club_list,
-            start_date__lte=now(),
-            end_date__gte=now(),
-        )
-    resp_args = {
-        "event": event,
-        "no_delay": True,
-        "gps_server": getattr(settings, "GPS_SSE_SERVER", None),
-    }
-    return render(request, "club/event.html", resp_args)
 
 
 @login_required
@@ -1297,6 +1348,27 @@ def dashboard_logo_download(request, club_id, *args, **kwargs):
 
 
 @login_required
+def dashboard_banner_download(request, club_id, *args, **kwargs):
+    if request.user.is_superuser:
+        club = get_object_or_404(Club, aid=club_id, banner__isnull=False)
+    else:
+        club = Club.objects.filter(
+            admins=request.user, aid=club_id, banner__isnull=False
+        ).first()
+    if not club:
+        raise Http404()
+    file_path = club.banner.name
+    return serve_from_s3(
+        settings.AWS_S3_BUCKET,
+        request,
+        file_path,
+        filename=f"{club.name}.webp",
+        mime="image/webp",
+        dl=False,
+    )
+
+
+@login_required
 @requires_club_in_session
 def event_route_upload_view(request, event_id):
     event = get_object_or_404(
@@ -1323,7 +1395,9 @@ def event_route_upload_view(request, event_id):
                     error = "Couldn't parse file"
             if not error:
                 device = Device.objects.create(
-                    aid=f"{short_random_key()}_GPX", is_gpx=True
+                    aid=f"{short_random_key()}_GPX",
+                    user_agent=request.session.user_agent[:200],
+                    is_gpx=True,
                 )
                 start_time = None
                 end_time = None
@@ -1345,7 +1419,7 @@ def event_route_upload_view(request, event_id):
                 if len(points) == 0:
                     error = "File does not contain valid points"
                 else:
-                    device.add_locations(points, push_forward=False)
+                    device.add_locations(points)
                     competitor = form.cleaned_data["competitor"]
                     competitor.device = device
                     if start_time and event.start_date <= start_time <= event.end_date:
@@ -1395,7 +1469,7 @@ def logoutOtherSessionsAfterPassChange(request, user, **kwargs):
 
 class CustomSessionDeleteOtherView(SessionDeleteOtherView):
     def get_success_url(self):
-        return str(reverse_lazy("dashboard:account_session_list"))
+        return str(reverse("dashboard:account_session_list"))
 
 
 @method_decorator(rate_limit(action="manage_email"), name="dispatch")
@@ -1408,7 +1482,7 @@ class CustomEmailView(EmailView):
         return ret
 
 
-email = login_required(CustomEmailView.as_view())
+email_view = login_required(CustomEmailView.as_view())
 
 
 class CustomBackupCodesView(BackupCodesView):
@@ -1420,3 +1494,47 @@ class CustomBackupCodesView(BackupCodesView):
 
 
 backup_codes = login_required(CustomBackupCodesView.as_view())
+
+
+@login_required
+@requires_club_in_session
+def upgrade(request):
+    club = request.club
+    return render(
+        request,
+        "dashboard/upgrade.html",
+        {
+            "club": club,
+        },
+    )
+
+
+@login_required
+@requires_club_in_session
+def device_list_download(request):
+    club = request.club
+    out = StringIO()
+    out.write("Nickname;Device ID;IMEI\n")
+    devices_qs = (
+        DeviceClubOwnership.objects.filter(club_id=club.id)
+        .select_related("device")
+        .defer("device__locations_encoded")
+        .order_by("nickname")
+    )
+    devices = {
+        own.device.aid: {"nickname": own.nickname, "aid": own.device.aid}
+        for own in devices_qs
+    }
+    imeis = ImeiDevice.objects.filter(
+        device_id__in=[device.device.id for device in devices_qs]
+    )
+    for imei in imeis:
+        devices[imei.device.aid]["imei"] = imei.imei
+    for dev in devices.values():
+        out.write(f'{dev.get("nickname")};{dev.get("aid")};{dev.get("imei", "")}\n')
+    response = StreamingHttpRangeResponse(
+        request, out.getvalue().encode("utf-8"), content_type="text/csv"
+    )
+    filename = f"device_list_{club.slug}.csv"
+    response["Content-Disposition"] = set_content_disposition(filename)
+    return response

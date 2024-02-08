@@ -13,23 +13,16 @@ def get_s3_client():
     )
 
 
-def s3_object_url(key, bucket):
+def s3_object_url(method, key, bucket):
     s3 = get_s3_client()
     return s3.generate_presigned_url(
-        ClientMethod="get_object", Params={"Bucket": bucket, "Key": key}
+        ClientMethod=f"{method.lower()}_object", Params={"Bucket": bucket, "Key": key}
     )
 
 
-def s3_key_exists(key, bucket):
+def s3_object_size(key, bucket):
     s3 = get_s3_client()
-    response = s3.list_objects(
-        Bucket=bucket,
-        Prefix=key,
-    )
-    for obj in response.get("Contents", []):
-        if obj["Key"] == key:
-            return True
-    return False
+    return s3.head_object(Bucket=bucket, Key=key).get("ContentLength", 0)
 
 
 def s3_delete_key(key, bucket):
@@ -38,13 +31,3 @@ def s3_delete_key(key, bucket):
         Bucket=bucket,
         Key=key,
     )
-
-
-def upload_to_s3(bucket, key, fileobj):
-    s3 = get_s3_client()
-    s3.upload_fileobj(fileobj, bucket, key)
-
-
-def download_from_s3(bucket, key, fileobj):
-    s3 = get_s3_client()
-    s3.download_fileobj(bucket, fileobj, key)

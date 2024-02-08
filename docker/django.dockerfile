@@ -1,4 +1,4 @@
-FROM python:3.11 as builder
+FROM python:3.12 as builder
 
 WORKDIR /app
 
@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE 1
 ENV PYTHONUNBUFFERED 1
 
 RUN apt-get update -qq && \
-    apt-get install -y --no-install-recommends g++ libgdal-dev libjpeg-dev zlib1g-dev libwebp-dev libmagic-dev libgl1 libpq5 && \
+    apt-get install -y --no-install-recommends g++ gcc libgdal-dev libjpeg-dev zlib1g-dev libwebp-dev libmagic-dev libgl1 libpq5 libjxl-dev && \
     apt-get clean -y && \
     rm -rf /var/lib/apt/lists/* /usr/share/doc /usr/share/man
 
@@ -16,20 +16,21 @@ ENV PATH="/root/.cargo/bin:$PATH"
 COPY requirements.txt .
 RUN pip wheel --no-cache-dir --no-deps --wheel-dir /app/wheels -r requirements.txt
 
-
 # final stage
-FROM python:3.11
+FROM python:3.11-slim
+
+RUN apt-get update -qq && \
+    apt-get install -y --no-install-recommends curl gcc g++ git libgdal-dev libjpeg-dev zlib1g-dev libwebp-dev libmagic-dev libgl1 libpq5 libglib2.0-0 libjxl-dev && \
+    apt-get clean -y && \
+    rm -rf /var/lib/apt/lists/* /usr/share/doc /usr/share/man
+
+RUN curl https://sh.rustup.rs -sSf | bash -s -- -y
+ENV PATH="/root/.cargo/bin:$PATH"
 
 COPY --from=builder /app/wheels /wheels
 COPY --from=builder /app/requirements.txt .
 
-
-RUN apt-get update -qq && \
-    apt-get install -y --no-install-recommends libgdal-dev libgl1 libpq5 && \
-    apt-get clean -y && \
-    rm -rf /var/lib/apt/lists/* /usr/share/doc /usr/share/man
-
-RUN pip install --no-cache /wheels/*
+RUN pip install -r ./requirements.txt --find-links /wheels && rm -rf /wheels && rm -rf /root/.cache/pip/*
 
 # Copy in your requirements file
 WORKDIR /app/
@@ -53,10 +54,11 @@ ENV DJANGO_SETTINGS_MODULE=routechoices.settings
 # ENV UWSGI_VIRTUALENV=/venv UWSGI_WSGI_FILE=routechoices/wsgi.py UWSGI_HTTP=:8000 UWSGI_MASTER=1 UWSGI_WORKERS=2 UWSGI_THREADS=8 UWSGI_UID=1000 UWSGI_GID=2000 UWSGI_LAZY_APPS=1 UWSGI_WSGI_ENV_BEHAVIOR=holy
 
 # Call collectstatic (customize the following line with the minimal environment variables needed for manage.py to run):
-RUN DATABASE_URL=none python manage.py collectstatic --noinput
+RUN cp ./.env.dev ./.env
+RUN DATABASE_URL="sqlite://:memory:" python manage.py collectstatic --noinput
 # ENTRYPOINT ["/app/docker-entrypoint.sh"]
 # Start uWSGI
 # CMD ["/venv/bin/uwsgi", "--http-auto-chunked", "--http-keepalive"]
 
-ADD docker/wait-for-it.sh /wait-for-it.sh
+ADD wait-for-it.sh /wait-for-it.sh
 RUN chmod 755 /wait-for-it.sh

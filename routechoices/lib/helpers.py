@@ -11,7 +11,6 @@ import zoneinfo
 from datetime import datetime
 from math import cos, pi, sin
 
-import numpy
 import requests
 from django.conf import settings
 from django.utils.dateparse import parse_datetime
@@ -25,6 +24,47 @@ from routechoices.lib.validators import validate_nice_slug
 UTC_TZ = zoneinfo.ZoneInfo("UTC")
 
 
+class MySite:
+    domain = settings.RELYING_PARTY_ID
+    name = settings.RELYING_PARTY_NAME
+
+
+def get_current_site():
+    return MySite()
+
+
+def int_to_alpha(i, alphabet=None):
+    if alphabet is None:
+        alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    alphabet_len = len(alphabet)
+    out = ""
+    while i > 0:
+        i -= 1
+        out += alphabet[i % alphabet_len]
+        i = i // alphabet_len
+    return out[::-1]
+
+
+def get_best_image_mime(request, default=None):
+    accepted_mimes = request.COOKIES.get(
+        "accept-image", request.META.get("HTTP_ACCEPT", "")
+    ).split(",")
+    for mime in ("image/avif", "image/jxl", "image/webp"):
+        if mime in accepted_mimes:
+            return mime
+    return default
+
+
+def git_master_hash():
+    try:
+        with open(
+            os.path.join(settings.BASE_DIR, ".git", "refs", "heads", "master")
+        ) as fp:
+            return fp.read(8)
+    except Exception:
+        return "dev"
+
+
 def epoch_to_datetime(t):
     return datetime.utcfromtimestamp(int(t)).replace(tzinfo=UTC_TZ)
 
@@ -34,12 +74,6 @@ def set_content_disposition(filename, dl=True):
     return f"{prefix}filename*=UTF-8''{urllib.parse.quote(filename, safe='')}"
 
 
-def safe32encode(b):
-    if isinstance(b, str):
-        b = b.encode("utf-8")
-    return base64.b32encode(b).decode().rstrip("=").lower()
-
-
 def safe64encode(b):
     if isinstance(b, str):
         b = b.encode("utf-8")
@@ -47,9 +81,9 @@ def safe64encode(b):
 
 
 def safe64encodedsha(txt):
-    h = hashlib.sha256()
     if isinstance(txt, str):
         txt = txt.encode("utf-8")
+    h = hashlib.sha256()
     h.update(txt)
     return safe64encode(h.digest())
 
@@ -58,12 +92,16 @@ def safe64decode(b):
     return base64.urlsafe_b64decode(b.encode() + b"==")
 
 
-def time_base64():
-    t = int(time.time())
-    b = struct.pack(">Q", t)
+def int_base64(i):
+    b = struct.pack(">Q", i)
     while b.startswith(b"\x00"):
         b = b[1:]
     return safe64encode(b)
+
+
+def time_base64():
+    t = int(time.time())
+    return int_base64(t)
 
 
 def deg2rad(deg):
@@ -105,7 +143,8 @@ def short_random_key():
 
 def random_device_id():
     alphabet = "0123456789"
-    return generate_random_string(alphabet, 8)
+    start = generate_random_string(alphabet[1:], 1)
+    return f"{start}{generate_random_string(alphabet, 7)}"
 
 
 def short_random_slug():
@@ -249,6 +288,8 @@ def general_2d_projection(a1, a2, a3, a4, b1, b2, b3, b4):
 
 def project(m, x, y):
     v = multiply_matrix_vector(m, [x, y, 1])
+    if v[2] == 0:
+        v[2] = 0.000000001
     return v[0] / v[2], v[1] / v[2]
 
 
@@ -299,7 +340,7 @@ def initial_of_name(name):
 
 def check_txt_record(domain):
     if not domain:
-        return
+        return False
 
     try:
         resp = requests.get(
@@ -331,7 +372,7 @@ def check_txt_record(domain):
 
 def check_cname_record(domain):
     if not domain:
-        return
+        return False
 
     try:
         resp = requests.get(
@@ -359,21 +400,6 @@ def check_cname_record(domain):
             return True
 
     return False
-
-
-def find_coeffs(pa, pb):
-    """
-    Find coefficients for perspective transformation.
-    From http://stackoverflow.com/a/14178717/4414003.
-    """
-    matrix = []
-    for p1, p2 in zip(pa, pb):
-        matrix.append([p1[0], p1[1], 1, 0, 0, 0, -p2[0] * p1[0], -p2[0] * p1[1]])
-        matrix.append([0, 0, 0, p1[0], p1[1], 1, -p2[1] * p1[0], -p2[1] * p1[1]])
-    a = numpy.matrix(matrix, dtype=numpy.float)
-    b = numpy.array(pb).reshape(8)
-    res = numpy.dot(numpy.linalg.inv(a.T * a) * a.T, b)
-    return numpy.array(res).reshape(8)
 
 
 def delete_domain(domain):

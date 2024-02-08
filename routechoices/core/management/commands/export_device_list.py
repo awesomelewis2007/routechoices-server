@@ -17,8 +17,11 @@ class Command(BaseCommand):
 
         self.stdout.write("Nickname;Device ID;IMEI\n")
 
-        devices_qs = DeviceClubOwnership.objects.filter(club_id=club.id).select_related(
-            "device"
+        devices_qs = (
+            DeviceClubOwnership.objects.filter(club_id=club.id)
+            .select_related("device")
+            .defer("device__locations_encoded")
+            .order_by("nickname")
         )
         devices = {
             own.device.aid: {"nickname": own.nickname, "aid": own.device.aid}

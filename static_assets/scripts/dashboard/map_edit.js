@@ -1,5 +1,5 @@
 pdfjsLib.GlobalWorkerOptions.workerSrc =
-  "//www.routechoices.com/static/vendor/pdfjs-3.3.122/pdf.worker.js";
+  "/static/vendor/pdfjs-3.3.122/pdf.worker.js";
 
 var extractCornersCoordsFromFilename = function (filename) {
   var re = /(_[-]?\d+(\.\d+)?){8}_\.(gif|png|jpg|jpeg|webp)$/;
@@ -50,6 +50,16 @@ var onPDF = function (ev, filename) {
             });
             var container = new DataTransfer();
             container.items.add(file);
+            if (container.files[0].size > 2 * 1e7) {
+              swal({
+                title: "Error!",
+                text: "File is too big!",
+                type: "error",
+                confirmButtonText: "OK",
+              });
+              u("#id_image").nodes[0].value = "";
+              return;
+            }
             u("#id_image").nodes[0].files = container.files;
             u("#id_image").trigger("change");
           },
@@ -194,10 +204,21 @@ function project(matrix, x, y) {
   return [val[0] / val[2], val[1] / val[2]];
 }
 
+function disableBtnToPreview() {
+  u("#to-calibration-step-2-button").addClass("d-none");
+  u("#to-calibration-step-2-button-disabled").removeClass("d-none");
+}
+function enableBtnToPreview() {
+  u("#to-calibration-step-2-button").removeClass("d-none");
+  u("#to-calibration-step-2-button-disabled").addClass("d-none");
+}
+
 (function () {
   function openCalibrationHelper() {
     u("#main").addClass("d-none");
     u("#calibration-helper").removeClass("d-none");
+    u("#calibration-helper").nodes[0].scrollIntoView();
+    disableBtnToPreview();
     markersRaster = [];
     markersWorld = [];
     cornersLatLng = [];
@@ -208,6 +229,14 @@ function project(matrix, x, y) {
   function closeCalibrationHelper() {
     u("#calibration-helper").addClass("d-none");
     u("#main").removeClass("d-none");
+  }
+
+  function show3pointsWarning() {
+    u("#three-points-helper").removeClass("d-none");
+  }
+
+  function hide3pointsWarning() {
+    u("#three-points-helper").addClass("d-none");
   }
 
   function closePreview() {
@@ -332,10 +361,19 @@ function project(matrix, x, y) {
   }
 
   function checkCalib() {
-    if (markersWorld.length == 4 && markersRaster.length == 4) {
-      u("#to-calibration-step-2-button").removeClass("disabled");
+    if (
+      markersWorld.length >= 3 &&
+      markersRaster.length >= 3 &&
+      !(markersWorld.length == 4 && markersRaster.length == 4)
+    ) {
+      show3pointsWarning();
     } else {
-      u("#to-calibration-step-2-button").addClass("disabled");
+      hide3pointsWarning();
+    }
+    if (markersWorld.length >= 3 && markersRaster.length >= 3) {
+      enableBtnToPreview();
+    } else {
+      disableBtnToPreview();
     }
   }
 
@@ -507,35 +545,109 @@ function project(matrix, x, y) {
     calibString = parts.join(",");
   }
 
+  function solveAffineMatrix(r1, s1, t1, r2, s2, t2, r3, s3, t3) {
+    const a =
+      ((t2 - t3) * (s1 - s2) - (t1 - t2) * (s2 - s3)) /
+      ((r2 - r3) * (s1 - s2) - (r1 - r2) * (s2 - s3));
+    const b =
+      ((t2 - t3) * (r1 - r2) - (t1 - t2) * (r2 - r3)) /
+      ((s2 - s3) * (r1 - r2) - (s1 - s2) * (r2 - r3));
+    const c = t1 - r1 * a - s1 * b;
+    return [a, b, c];
+  }
+
+  function deriveAffineTransform(a, b, c) {
+    const e = 1e-15;
+    a.xy.x -= e;
+    a.xy.y += e;
+    b.xy.x += e;
+    b.xy.y -= e;
+    c.xy.x += e;
+    c.xy.y += e;
+    x = solveAffineMatrix(
+      a.xy.x,
+      a.xy.y,
+      a.latLonMeters.x,
+      b.xy.x,
+      b.xy.y,
+      b.latLonMeters.x,
+      c.xy.x,
+      c.xy.y,
+      c.latLonMeters.x
+    );
+    y = solveAffineMatrix(
+      a.xy.x,
+      a.xy.y,
+      a.latLonMeters.y,
+      b.xy.x,
+      b.xy.y,
+      b.latLonMeters.y,
+      c.xy.x,
+      c.xy.y,
+      c.latLonMeters.y
+    );
+    return x.concat(y);
+  }
+
   function computeCalibString() {
     const rasterXY = [];
     const worldXY = [];
     var proj = new SpheroidProjection();
-    for (var i = 0; i < 4; i++) {
-      rasterXY[i] = rasterCalibMap.project(markersRaster[i].getLatLng(), 0);
-      worldXY[i] = proj.latlngToMeters(markersWorld[i].getLatLng());
-    }
-    var matrix3d = general2DProjection(
-      rasterXY[0],
-      worldXY[0],
-      rasterXY[1],
-      worldXY[1],
-      rasterXY[2],
-      worldXY[2],
-      rasterXY[3],
-      worldXY[3]
-    );
-    var cornersXY = [
-      project(matrix3d, 0, 0),
-      project(matrix3d, rasterMapImage.width, 0),
-      project(matrix3d, rasterMapImage.width, rasterMapImage.height),
-      project(matrix3d, 0, rasterMapImage.height),
-    ];
-    for (var i = 0; i < cornersXY.length; i++) {
-      cornersLatLng[i] = proj.metersToLatLng({
-        x: cornersXY[i][0],
-        y: cornersXY[i][1],
-      });
+    if (markersRaster.length === 4 && markersWorld.length === 4) {
+      for (var i = 0; i < 4; i++) {
+        rasterXY[i] = rasterCalibMap.project(markersRaster[i].getLatLng(), 0);
+        worldXY[i] = proj.latlngToMeters(markersWorld[i].getLatLng());
+      }
+      var matrix3d = general2DProjection(
+        rasterXY[0],
+        worldXY[0],
+        rasterXY[1],
+        worldXY[1],
+        rasterXY[2],
+        worldXY[2],
+        rasterXY[3],
+        worldXY[3]
+      );
+      var cornersXY = [
+        project(matrix3d, 0, 0),
+        project(matrix3d, rasterMapImage.width, 0),
+        project(matrix3d, rasterMapImage.width, rasterMapImage.height),
+        project(matrix3d, 0, rasterMapImage.height),
+      ];
+      for (var i = 0; i < cornersXY.length; i++) {
+        cornersLatLng[i] = proj.metersToLatLng({
+          x: cornersXY[i][0],
+          y: cornersXY[i][1],
+        });
+      }
+    } else if (markersRaster.length >= 3 && markersWorld.length >= 3) {
+      const calPts = [];
+      for (var i = 0; i < 3; i++) {
+        rasterXY[i] = rasterCalibMap.project(markersRaster[i].getLatLng(), 0);
+        worldXY[i] = proj.latlngToMeters(markersWorld[i].getLatLng());
+        calPts.push({
+          latLonMeters: worldXY[i],
+          xy: rasterXY[i],
+        });
+      }
+      const xyToLatLngMetersCoeffs = deriveAffineTransform(...calPts);
+      function mapXYtoLatLng(xy) {
+        const x =
+          xy.x * xyToLatLngMetersCoeffs[0] +
+          xy.y * xyToLatLngMetersCoeffs[1] +
+          xyToLatLngMetersCoeffs[2];
+        const y =
+          xy.x * xyToLatLngMetersCoeffs[3] +
+          xy.y * xyToLatLngMetersCoeffs[4] +
+          xyToLatLngMetersCoeffs[5];
+        return proj.metersToLatLng(new Point(x, y));
+      }
+      cornersLatLng = [
+        mapXYtoLatLng(new Point(0, 0)),
+        mapXYtoLatLng(new Point(rasterMapImage.width, 0)),
+        mapXYtoLatLng(new Point(rasterMapImage.width, rasterMapImage.height)),
+        mapXYtoLatLng(new Point(0, rasterMapImage.height)),
+      ];
     }
     buildCalibString(cornersLatLng);
   }
@@ -557,7 +669,7 @@ function project(matrix, x, y) {
   var cornersLatLng = [];
   var calibString = null;
   var calibHelpTexts = [
-    "Select 4 distincts points on the raster map and on the world map.",
+    "Select 4 distinct locations on the raster map and match their locations on the world map. The best is to select four points as much apart from each other as possible.",
     "Check that the raster map is aligned with the world map.",
   ];
 
@@ -567,7 +679,11 @@ function project(matrix, x, y) {
   );
 
   u("#id_image").on("change", function () {
-    if (this.files.length > 0 && this.files[0].size > 2 * 1e7) {
+    if (
+      this.files.length > 0 &&
+      this.files[0].size > 2 * 1e7 &&
+      this.files[0].type !== "application/pdf"
+    ) {
       swal({
         title: "Error!",
         text: "File is too big!",
@@ -593,15 +709,20 @@ function project(matrix, x, y) {
       u("#calibration_help").removeClass("d-none");
       u("#id_corners_coordinates").trigger("change");
     } else {
-      u("#calibration_help").addClass("d-none");
-      u("#calibration_preview").addClass("d-none");
+      if (!u("#main-form").hasClass("edit-form")) {
+        u("#calibration_help").addClass("d-none");
+        u("#calibration_preview").addClass("d-none");
+      }
     }
   });
 
   u("#id_corners_coordinates").on("change", function (e) {
     var val = e.target.value;
     var found = isValidCalibString(val);
-    if (found && u("#id_image").val()) {
+    if (
+      found &&
+      (u("#id_image").val() || u("#main-form").hasClass("edit-form"))
+    ) {
       u("#calibration_preview").removeClass("d-none");
     } else {
       u("#calibration_preview").addClass("d-none");
@@ -622,7 +743,7 @@ function project(matrix, x, y) {
     }
     markersRaster = [];
     L.DomUtil.addClass(rasterCalibMap._container, "crosshair-cursor");
-    u("#to-calibration-step-2-button").addClass("disabled");
+    disableBtnToPreview();
   });
 
   u("#reset-world-markers-button").on("click", function (e) {
@@ -632,7 +753,7 @@ function project(matrix, x, y) {
     }
     markersWorld = [];
     L.DomUtil.addClass(worldCalibMap._container, "crosshair-cursor");
-    u("#to-calibration-step-2-button").addClass("disabled");
+    disableBtnToPreview();
   });
 
   u("#to-calibration-step-2-button").on("click", function (e) {
@@ -641,6 +762,7 @@ function project(matrix, x, y) {
     u("#calibration-help-text").text(calibHelpTexts[1]);
     u("#calibration-step-1").addClass("d-none");
     u("#calibration-step-2").removeClass("d-none");
+    u("#calibration-helper").nodes[0].scrollIntoView();
     displayCalibPreviewMap();
   });
 
@@ -649,6 +771,7 @@ function project(matrix, x, y) {
     u("#calibration-help-text").text(calibHelpTexts[0]);
     u("#calibration-step-2").addClass("d-none");
     u("#calibration-step-1").removeClass("d-none");
+    u("#calibration-helper").nodes[0].scrollIntoView();
   });
 
   u("#validate-calibration-button").on("click", function (e) {

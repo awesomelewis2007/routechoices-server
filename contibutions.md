@@ -12,7 +12,7 @@ Media:
 Translations:
 -------------
 
-    Raphaël Stefanini, Santiago Isaza Hurtado, Saara Norrgrann, Toon Melis, Jukka Inkeri
+    Raphaël Stefanini, Santiago Isaza Hurtado, Saara Norrgrann, Toon Melis, Jukka Inkeri, Michał Kuś
 
 
 JS Libraries:
@@ -74,8 +74,7 @@ PyPi Packages:
     drf-orjson-renderer         MIT License
     drf-yasg                    BSD License
     geoip2                      Apache Software License
-    gitpython                   BSD License
-    gps-encoding                MIT
+    gps-data-codec              MIT
     gpxpy                       Apache License, Version 2.0
     kagi                        BSD-2-Clause license
     numpy                       BSD License
@@ -86,7 +85,6 @@ PyPi Packages:
     pip-tools                   BSD License
     psycopg2                    GNU Library or Lesser General Public License (LGPL)
     python-magic                MIT License
-    redis                       MIT License
     requests                    Apache Software License
     sewer                       MIT License
     tornado                     Apache Software License

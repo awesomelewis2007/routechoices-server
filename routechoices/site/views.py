@@ -1,3 +1,7 @@
+from decimal import Decimal
+
+import arrow
+import requests
 from allauth.account.forms import LoginForm
 from allauth.account.models import EmailAddress
 from allauth.account.views import LoginView
@@ -5,17 +9,95 @@ from django.conf import settings
 from django.contrib import auth, messages
 from django.core.mail import EmailMessage
 from django.http import HttpResponse, HttpResponseRedirect
-from django.shortcuts import get_object_or_404, redirect, render
+from django.shortcuts import redirect, render
 from django.utils.http import url_has_allowed_host_and_scheme, urlencode
 from django_hosts.resolvers import reverse
 
-from routechoices.core.models import Event
+from routechoices.core.models import Club, Event, IndividualDonator
+from routechoices.lib.streaming_response import StreamingHttpRangeResponse
 from routechoices.site.forms import ContactForm
 
 
-def event_shortcut(request, event_id):
-    event = get_object_or_404(Event.objects.select_related("club"), aid=event_id)
-    return redirect(event.get_absolute_url())
+def home_page(request):
+    club_partners = Club.objects.filter(upgraded=True).order_by("name")
+    indi_partners = IndividualDonator.objects.filter(upgraded=True).order_by("name")
+    return render(
+        request,
+        "site/home.html",
+        {"partner_clubs": club_partners, "individual_partners": indi_partners},
+    )
+
+
+def site_favicon(request, icon_name, **kwargs):
+    icon_info = {
+        "favicon.ico": {"size": 32, "format": "ICO", "mime": "image/x-icon"},
+        "apple-touch-icon.png": {"size": 180, "format": "PNG", "mime": "image/png"},
+        "icon-192.png": {"size": 192, "format": "PNG", "mime": "image/png"},
+        "icon-512.png": {"size": 512, "format": "PNG", "mime": "image/png"},
+    }.get(icon_name)
+    with open(f"{settings.BASE_DIR}/static_assets/{icon_name}", "rb") as fp:
+        data = fp.read()
+    return StreamingHttpRangeResponse(request, data, content_type=icon_info["mime"])
+
+
+def pricing_page(request):
+    if request.method == "POST":
+        price = request.POST.get("price-per-month", "4.99")
+        price = max(Decimal(4.99), Decimal(price))
+        yearly_payment = request.POST.get("per-year", False) == "on"
+        final_price = price * Decimal(100)
+        if yearly_payment:
+            final_price *= 12
+        body = {
+            "data": {
+                "type": "checkouts",
+                "attributes": {
+                    "custom_price": int(final_price),
+                    "product_options": {
+                        "enabled_variants": [78515 if yearly_payment else 78535],
+                    },
+                    "checkout_options": {
+                        "embed": True,
+                        "desc": False,
+                    },
+                    "preview": False,
+                    "expires_at": arrow.utcnow().shift(hours=1).isoformat(),
+                },
+                "relationships": {
+                    "store": {"data": {"type": "stores", "id": "19955"}},
+                    "variant": {
+                        "data": {
+                            "type": "variants",
+                            "id": "78515" if yearly_payment else "78535",
+                        }
+                    },
+                },
+            }
+        }
+        if club_slug := request.POST.get("club"):
+            body["data"]["attributes"]["checkout_data"] = {
+                "custom": {"club": club_slug}
+            }
+        r = requests.post(
+            "https://api.lemonsqueezy.com/v1/checkouts",
+            headers={
+                "Accept": "application/vnd.api+json",
+                "Authorization": f"Bearer {settings.LEMONSQUEEZY_API_KEY}",
+                "Content-Type": "application/vnd.api+json",
+            },
+            json=body,
+        )
+        if r.status_code // 100 == 2:
+            data = r.json()
+            return redirect(data["data"]["attributes"]["url"])
+        messages.error(request, "Something went wrong!")
+    partners = Club.objects.filter(upgraded=True).order_by("name")
+    indi_partners = IndividualDonator.objects.filter(upgraded=True).order_by("name")
+    return render(
+        request,
+        "site/pricing.html",
+        {"partner_clubs": partners, "individual_partners": indi_partners},
+    )
 
 
 def events_view(request):
@@ -37,8 +119,8 @@ def contact(request):
                 message,
                 settings.DEFAULT_FROM_EMAIL,
                 [settings.EMAIL_CUSTOMER_SERVICE],
+                reply_to=[from_email],
             )
-            msg.content_subtype = "html"
             msg.send()
             messages.success(request, "Message sent succesfully")
             return redirect("site:contact_view")
@@ -75,28 +157,28 @@ class CustomLoginView(LoginView):
         if not self.requires_two_factor(user):
             # no keys registered, use single-factor auth
             return super().form_valid(form)
-        else:
-            self.request.session["kagi_pre_verify_user_pk"] = user.pk
-            self.request.session["kagi_pre_verify_user_backend"] = user.backend
 
-            verify_url = reverse("kagi:verify-second-factor")
-            redirect_to = self.request.POST.get(
-                auth.REDIRECT_FIELD_NAME,
-                self.request.GET.get(auth.REDIRECT_FIELD_NAME, ""),
-            )
-            params = {}
-            if url_has_allowed_host_and_scheme(
-                url=redirect_to,
-                allowed_hosts=[self.request.get_host()],
-                require_https=True,
-            ):
-                params[auth.REDIRECT_FIELD_NAME] = redirect_to
-            if self.is_admin:
-                params["admin"] = 1
-            if params:
-                verify_url += "?" + urlencode(params)
+        self.request.session["kagi_pre_verify_user_pk"] = user.pk
+        self.request.session["kagi_pre_verify_user_backend"] = user.backend
 
-            return HttpResponseRedirect(verify_url)
+        verify_url = reverse("kagi:verify-second-factor")
+        redirect_to = self.request.POST.get(
+            auth.REDIRECT_FIELD_NAME,
+            self.request.GET.get(auth.REDIRECT_FIELD_NAME, ""),
+        )
+        params = {}
+        if url_has_allowed_host_and_scheme(
+            url=redirect_to,
+            allowed_hosts=[self.request.get_host()],
+            require_https=True,
+        ):
+            params[auth.REDIRECT_FIELD_NAME] = redirect_to
+        if self.is_admin:
+            params["admin"] = 1
+        if params:
+            verify_url += "?" + urlencode(params)
+
+        return HttpResponseRedirect(verify_url)
 
     def get_context_data(self, **kwargs):
         kwargs = super().get_context_data(**kwargs)

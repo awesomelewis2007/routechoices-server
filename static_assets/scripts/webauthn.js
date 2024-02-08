@@ -12,6 +12,9 @@
  */
 
 const populateWebAuthnErrorList = (errors) => {
+  var btn = u("#webauthn-feature button");
+  btn.find("i").remove();
+  btn.removeClass("disabled");
   const errorList = document.getElementById("webauthn-errors");
   if (errorList === null) {
     return;
@@ -39,7 +42,7 @@ const doWebAuthn = (formId, func) => {
     return null;
   }
 
-  const webAuthnButton = webAuthnForm.querySelector("button[type=submit]");
+  const webAuthnButton = webAuthnForm.querySelector("button[name=submit]");
   webAuthnButton.disabled = false;
 
   webAuthnForm.addEventListener("submit", async () => {
@@ -144,7 +147,7 @@ const postCredential = async (keyName, credential, token) => {
     credentials: "same-origin",
   });
 
-  return await resp.json();
+  return resp.json();
 };
 
 const postAssertion = async (assertion, token) => {
@@ -159,7 +162,7 @@ const postAssertion = async (assertion, token) => {
     credentials: "same-origin",
   });
 
-  return await resp.json();
+  return resp.json();
 };
 
 const GuardWebAuthn = () => {
@@ -212,7 +215,6 @@ const ProvisionWebAuthn = () => {
         window.location.replace(Kagi.keys_list);
       })
       .catch((error) => {
-        console.log(error);
         populateWebAuthnErrorList([error.message]);
         return;
       });

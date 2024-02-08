@@ -21,9 +21,8 @@ from django_hosts.resolvers import reverse
 from drf_yasg import openapi
 from drf_yasg.utils import swagger_auto_schema
 from rest_framework import renderers, status
-from rest_framework.decorators import api_view, renderer_classes, throttle_classes
+from rest_framework.decorators import api_view, throttle_classes
 from rest_framework.exceptions import ValidationError
-from rest_framework.renderers import JSONRenderer
 from rest_framework.response import Response
 from rest_framework.throttling import AnonRateThrottle
 
@@ -50,8 +49,10 @@ from routechoices.core.models import (
 from routechoices.lib.globalmaptiles import GlobalMercator
 from routechoices.lib.helpers import (
     epoch_to_datetime,
+    git_master_hash,
     initial_of_name,
     random_device_id,
+    safe64encodedsha,
     set_content_disposition,
     short_random_key,
     short_random_slug,
@@ -87,20 +88,15 @@ def serve_from_s3(
     headers=None,
     dl=True,
 ):
-    url = s3_object_url(path, bucket)
+    if request.method not in ("GET", "HEAD"):
+        raise NotImplementedError()
+
+    url = s3_object_url(request.method, path, bucket)
     url = url[len(settings.AWS_S3_ENDPOINT_URL) :]
 
-    response_status = status.HTTP_200_OK
-    if request.method == "GET":
-        response_status = status.HTTP_206_PARTIAL_CONTENT
-
-    response = HttpResponse(
-        "", status=response_status, headers=headers, content_type=mime
-    )
-
-    if request.method == "GET":
-        response["X-Accel-Redirect"] = urllib.parse.quote(f"/s3{url}".encode("utf-8"))
-        response["X-Accel-Buffering"] = "no"
+    response = HttpResponse("", headers=headers, content_type=mime)
+    response["X-Accel-Redirect"] = urllib.parse.quote(f"/s3{url}".encode("utf-8"))
+    response["X-Accel-Buffering"] = "no"
     response["Content-Disposition"] = set_content_disposition(filename, dl=dl)
     return response
 
@@ -115,7 +111,7 @@ club_param = openapi.Parameter(
 event_param = openapi.Parameter(
     "event",
     openapi.IN_QUERY,
-    description="Filter by this event slug",
+    description="Filter by this event slug or url",
     type=openapi.TYPE_STRING,
 )
 
@@ -134,14 +130,12 @@ mine_param = openapi.Parameter(
 @login_required
 @api_view(["POST"])
 def event_set_creation(request):
-    club_id = request.data.get("club_id")
-    club = Club.objects.filter(aid=club_id).first()
+    club_slug = request.data.get("club_slug")
     name = request.data.get("name")
-    if not name or not club:
+    if not name or not club_slug:
         raise ValidationError("Missing parameter")
-    is_user_event_admin = (
-        request.user.is_superuser or club.admins.filter(id=request.user.id).exists()
-    )
+    club = Club.objects.filter(slug=club_slug).first()
+    is_user_event_admin = club.admins.filter(id=request.user.id).exists()
     if not is_user_event_admin:
         raise PermissionDenied("not club admin")
     event_set, created = EventSet.objects.get_or_create(club=club, name=name)
@@ -286,12 +280,7 @@ def event_list(request):
         club_slug = request.data.get("club_slug")
         if not club_slug:
             raise ValidationError("club_slug is required")
-        if request.user.is_superuser:
-            club = Club.objects.filter(slug__iexact=club_slug).first()
-        else:
-            club = Club.objects.filter(
-                admins=request.user, slug__iexact=club_slug
-            ).first()
+        club = Club.objects.filter(admins=request.user, slug__iexact=club_slug).first()
         if not club:
             raise ValidationError("club not found")
 
@@ -349,8 +338,8 @@ def event_list(request):
 
         event = Event(
             club=club,
-            name=name,
             slug=slug,
+            name=name,
             start_date=start_date,
             end_date=end_date,
             privacy=privacy,
@@ -361,6 +350,7 @@ def event_list(request):
         try:
             event.full_clean()
         except Exception as e:
+            event.delete()
             raise ValidationError(e)
         event.save()
         output = {
@@ -381,17 +371,19 @@ def event_list(request):
 
     club_slug = request.GET.get("club")
     event_slug = request.GET.get("event")
+    event_url = None
 
-    if event_slug and club_slug:
+    if event_slug and "/" in event_slug:
+        event_url = event_slug
+        event_slug = None
+
+    if (event_slug and club_slug) or event_url:
         privacy_arg = {"privacy__in": [PRIVACY_PUBLIC, PRIVACY_SECRET]}
     else:
         privacy_arg = {"privacy": PRIVACY_PUBLIC}
 
     if request.user.is_authenticated:
-        if request.user.is_superuser:
-            clubs = Club.objects.all()
-        else:
-            clubs = Club.objects.filter(admins=request.user)
+        clubs = Club.objects.filter(admins=request.user)
         events = Event.objects.filter(
             Q(**privacy_arg) | Q(club__in=clubs)
         ).select_related("club")
@@ -402,7 +394,18 @@ def event_list(request):
         events = events.filter(club__slug__iexact=club_slug)
     if event_slug:
         events = events.filter(slug__iexact=event_slug)
-
+    if event_url:
+        url = urllib.parse.urlparse(event_url)
+        domain = url.netloc
+        if domain.endswith(f".{settings.PARENT_HOST}"):
+            club_slug = domain[: -(len(settings.PARENT_HOST) + 1)]
+            events.filter(club__slug__iexact=club_slug)
+        else:
+            events.filter(club__domain__iexact=domain)
+        event_slug = url.path[1:]
+        if event_slug.endswith("/"):
+            event_slug = event_slug[:-1]
+        events = events.filter(slug__iexact=event_slug)
     output = []
     for event in events:
         output.append(
@@ -426,7 +429,7 @@ def event_list(request):
 
 @swagger_auto_schema(
     method="get",
-    operation_id="clubs_list",
+    operation_id="club_list",
     operation_description="List clubs",
     tags=["Clubs"],
     manual_parameters=[mine_param],
@@ -436,14 +439,12 @@ def event_list(request):
             examples={
                 "application/json": [
                     {
-                        "id": "PlCG3xFS-f4",
                         "name": "Kangasala SK",
                         "slug": "ksk",
                         "url": "https://ksk.routechoices.com/",
                         "owner": False,
                     },
                     {
-                        "id": "ohFYzJep1hI",
                         "name": "Halden SK",
                         "slug": "halden-sk",
                         "url": "https://gps.haldensk.no/",
@@ -456,26 +457,21 @@ def event_list(request):
     },
 )
 @api_view(["GET"])
-def club_list(request):
+def club_list_view(request):
     only_yours = request.GET.get("mine")
     clubs = Club.objects.all()
     owned_clubs = Club.objects.none()
-    if request.user.is_superuser:
-        owned_clubs = clubs
-    elif request.user.is_authenticated:
+    if request.user.is_authenticated:
         owned_clubs = clubs.filter(admins=request.user)
-
-    if only_yours and not request.user.is_superuser:
-        clubs = clubs.filter(admins=request.user)
-
+    if only_yours:
+        clubs = owned_clubs
     output = []
     for club in clubs:
         data = {
-            "id": club.aid,
             "name": club.name,
             "slug": club.slug,
             "url": club.nice_url,
-            "owned": only_yours or request.user.is_superuser or (club in owned_clubs),
+            "owned": only_yours or (club in owned_clubs),
         }
         if not only_yours or data["owned"]:
             output.append(data)
@@ -503,8 +499,8 @@ def club_list(request):
                         "privacy": "public",
                         "open_registration": False,
                         "open_route_upload": False,
-                        "url": "https://www.routechoices.com/ksk/Jukola-2019-1st-leg",
-                        "shortcut": "https://routechoic.es/PlCG3xFS-f4",
+                        "url": "https://ksk.routechoices.com/Jukola-2019-1st-leg",
+                        "shortcut": "https://routechoic.es/ksk/Jukola-2019-1st-leg",
                         "backdrop": "osm",
                         "send_interval": 5,
                         "tail_length": 60,
@@ -539,7 +535,6 @@ def club_list(request):
     },
 )
 @api_view(["GET"])
-@renderer_classes([JSONRenderer])
 def event_detail(request, event_id):
     event = (
         Event.objects.select_related("club", "notice", "map")
@@ -557,13 +552,7 @@ def event_detail(request, event_id):
         res = {"error": "No event match this id"}
         return Response(res)
 
-    is_user_club_admin = (
-        request.user.is_superuser
-        or event.club.admins.filter(id=request.user.id).exists()
-    )
-
-    if event.privacy == PRIVACY_PRIVATE and not is_user_club_admin:
-        raise PermissionDenied()
+    event.check_user_permission(request.user)
 
     output = {
         "event": {
@@ -597,7 +586,7 @@ def event_detail(request, event_id):
             map_data = {
                 "title": event.map_title,
                 "coordinates": event.map.bound,
-                "rotation": event.map.rotation,
+                "rotation": event.map.north_declination,
                 "hash": event.map.hash,
                 "max_zoom": event.map.max_zoom,
                 "modification_date": event.map.modification_date,
@@ -616,7 +605,7 @@ def event_detail(request, event_id):
             map_data = {
                 "title": m.title,
                 "coordinates": m.map.bound,
-                "rotation": m.map.rotation,
+                "rotation": m.map.north_declination,
                 "hash": m.map.hash,
                 "max_zoom": m.map.max_zoom,
                 "modification_date": m.map.modification_date,
@@ -632,9 +621,10 @@ def event_detail(request, event_id):
             }
             output["maps"].append(map_data)
 
-    headers = None
+    headers = {"ETag": f'W/"{safe64encodedsha(json.dumps(output))}"'}
     if event.privacy == PRIVACY_PRIVATE:
-        headers = {"Cache-Control": "Private"}
+        headers["Cache-Control"] = "Private"
+
     return Response(output, headers=headers)
 
 
@@ -696,8 +686,7 @@ def event_register(request, event_id):
 
     if not event.open_registration:
         if not request.user.is_authenticated or (
-            not request.user.is_superuser
-            and request.user not in event.club.admins.all()
+            request.user not in event.club.admins.all()
         ):
             raise PermissionDenied()
 
@@ -714,6 +703,9 @@ def event_register(request, event_id):
             "bad-name": "Name already in use in this event",
             "bad-sname": "Short name already in use in this event",
             "registration-closed": "Registration is closed",
+            "start-time-already-used": (
+                "This device is already registered for this same start time"
+            ),
         },
         "es": {
             "no-device-id": "ID del dispositivo no encontrado",
@@ -725,6 +717,9 @@ def event_register(request, event_id):
             "bad-name": "Nombre ya en uso en este evento",
             "bad-sname": "Nombre corto ya en uso en este evento",
             "registration-closed": "Las inscripciones están cerradas",
+            "start-time-already-used": (
+                "Este dispositivo ya está registrado para esta misma hora de inicio"
+            ),
         },
         "fr": {
             "no-device-id": "Identifiant de l'appareil introuvable",
@@ -736,6 +731,9 @@ def event_register(request, event_id):
             "bad-name": "Nom déjà utilisé dans cet événement",
             "bad-sname": "Nom abrégé déjà utilisé dans cet événement",
             "registration-closed": "Les inscriptions sont closes",
+            "start-time-already-used": (
+                "Cet appareil est déjà enregistré pour cette même heure de départ"
+            ),
         },
         "fi": {
             "no-device-id": "Laitetunnusta ei löydy",
@@ -745,6 +743,9 @@ def event_register(request, event_id):
             "bad-name": "Nimi on jo käytössä tässä tapahtumassa",
             "bad-sname": "Lyhyt nimi jo käytössä tässä tapahtumassa",
             "registration-closed": "Ilmoittautumiset on suljettu",
+            "start-time-already-used": (
+                "Tämä laite on jo rekisteröity samalle aloitusajalle"
+            ),
         },
         "nl": {
             "no-device-id": "Toestel ID niet gevonden",
@@ -754,6 +755,21 @@ def event_register(request, event_id):
             "bad-name": "Naam al in gebruik in dit evenement",
             "bad-sname": "Korte naam al in gebruik in dit evenement",
             "registration-closed": "Inschrijvingen zijn gesloten",
+            "start-time-already-used": (
+                "Dit toestel is al aangemeld voor dezelfde starttijd"
+            ),
+        },
+        "pl": {
+            "no-device-id": "Nie znaleziono urządzenia",
+            "no-name": "Brak imienia",
+            "invalid-start-time": "Niepoprawny zapis czasu",
+            "bad-start-time": "Godzina startu musi mieścić się w czasie trwania zawodów",
+            "bad-name": "Zawodnik o tym imieniu już istnieje",
+            "bad-sname": "Identyfikator uczestnika już istnieje",
+            "registration-closed": "Anmälningarna är stängda",
+            "start-time-already-used": (
+                "To urządzenie jest już zarejestrowane na ten sam czas rozpoczęcia"
+            ),
         },
         "sv": {
             "no-device-id": "Enhets-ID hittades inte",
@@ -763,6 +779,9 @@ def event_register(request, event_id):
             "bad-name": "Namnet används redan i det här evenemanget",
             "bad-sname": "Kortnamn används redan i det här evenemanget",
             "registration-closed": "Anmälningarna är stängda",
+            "start-time-already-used": (
+                "Enheten är redan registrerad för samma starttid."
+            ),
         },
     }
 
@@ -776,7 +795,7 @@ def event_register(request, event_id):
     if not name:
         errs.append(err_messages[lang]["no-name"])
     short_name = request.data.get("short_name")
-    if not short_name:
+    if name and not short_name:
         short_name = initial_of_name(name)
     start_time_query = request.data.get("start_time")
     if start_time_query:
@@ -804,10 +823,18 @@ def event_register(request, event_id):
         errs.append(err_messages[lang]["bad-sname"])
 
     device_id = request.data.get("device_id")
-    device = Device.objects.filter(aid=device_id).first()
+    device = Device.objects.filter(aid=device_id).defer("locations_encoded").first()
 
     if not device and device_id:
         errs.append(err_messages[lang]["no-device-id"])
+
+    if (
+        device
+        and Competitor.objects.filter(
+            start_time=start_time, device_id=device.id
+        ).exists()
+    ):
+        errs.append(err_messages[lang]["start-time-already-used"])
 
     if errs:
         raise ValidationError(errs)
@@ -864,10 +891,7 @@ def competitor_api(request, competitor_id):
 
     event = competitor.event
 
-    is_user_event_admin = (
-        request.user.is_superuser
-        or event.club.admins.filter(id=request.user.id).exists()
-    )
+    is_user_event_admin = event.club.admins.filter(id=request.user.id).exists()
     if not is_user_event_admin:
         raise PermissionDenied()
 
@@ -936,7 +960,7 @@ def competitor_route_upload(request, competitor_id):
     is_user_event_admin = (
         request.user.is_authenticated
         and event.club.admins.filter(id=request.user.id).exists()
-    ) or request.user.is_superuser
+    )
 
     if not event.allow_route_upload:
         raise PermissionDenied()
@@ -967,7 +991,8 @@ def competitor_route_upload(request, competitor_id):
         raise ValidationError("Minimum amount of locations is 2")
 
     loc_array = []
-    for i in range(len(times)):
+    start_time = None
+    for i, _ in enumerate(times):
         if times[i] and lats[i] and lons[i]:
             lat = lats[i]
             lon = lons[i]
@@ -985,6 +1010,8 @@ def competitor_route_upload(request, competitor_id):
             except Exception:
                 raise ValidationError("Invalid time value")
             if event.start_date.timestamp() <= tim <= event.end_date.timestamp():
+                if not start_time or tim < start_time:
+                    start_time = int(tim)
                 loc_array.append((int(tim), lat, lon))
 
     device = None
@@ -994,8 +1021,9 @@ def competitor_route_upload(request, competitor_id):
             user_agent=request.session.user_agent[:200],
             is_gpx=True,
         )
-        device.add_locations(loc_array, push_forward=False)
+        device.add_locations(loc_array)
         competitor.device = device
+        competitor.start_time = epoch_to_datetime(start_time)
         competitor.save()
 
     if len(loc_array) == 0:
@@ -1045,12 +1073,10 @@ def event_data(request, event_id):
     event = None
 
     use_cache = getattr(settings, "CACHE_EVENT_DATA", False)
-    if not use_cache:
-        return None
 
     cache_interval = EVENT_CACHE_INTERVAL
     live_cache_ts = int(t0 // cache_interval)
-    live_cache_key = f"live_event_data:{event_id}:{live_cache_ts}"
+    live_cache_key = f"event:{event_id}:data:{live_cache_ts}:live"
     if use_cache and cache.has_key(live_cache_key):
         cache_key_found = live_cache_key
         try:
@@ -1066,13 +1092,13 @@ def event_data(request, event_id):
         .first()
     )
     if not event:
-        res = {"error": "No event match this id"}
-        return Response(res)
+        response = {"error": "No event match this id"}
+        return Response(response)
 
     cache_ts = int(t0 // (cache_interval if event.is_live else 7 * 24 * 3600))
-    cache_prefix = "live" if event.is_live else "archived"
-    cache_key = f"{cache_prefix}_event_data:{event_id}:{cache_ts}"
-    prev_cache_key = f"{cache_prefix}_event_data:{event_id}:{cache_ts - 1}"
+    cache_suffix = "live" if event.is_live else "archived"
+    cache_key = f"event:{event_id}:data:{cache_ts}:{cache_suffix}"
+    prev_cache_key = f"event:{event_id}:data:{cache_ts - 1}:{cache_suffix}"
     # then if we have a cache for that
     # return it if we do
     if use_cache and not event.is_live and cache.has_key(cache_key):
@@ -1102,78 +1128,79 @@ def event_data(request, event_id):
         except Exception:
             pass
 
-    if event.privacy == PRIVACY_PRIVATE and not request.user.is_superuser:
-        if (
-            not request.user.is_authenticated
-            or not event.club.admins.filter(id=request.user.id).exists()
-        ):
-            raise PermissionDenied()
+    event.check_user_permission(request.user)
 
     competitors = (
         event.competitors.select_related("device").all().order_by("start_time", "name")
     )
-    devices = (c.device_id for c in competitors if c.device_id)
-
-    # we need this to determine the end time of the competitor device stream
-    all_devices_competitors = (
+    # We need this to determine the end time of each of this event's competitors
+    # For each devices used in the event we fetch all the competitors that starts during this event's span
+    # We order the device's competitors by their start time
+    # We then pick and for each of this event competitor the other competitor that comes after its own start time
+    max_end_date = min(event.end_date, now())
+    devices_used = (
+        competitor.device_id for competitor in competitors if competitor.device_id
+    )
+    competitors_for_devices_during_event = (
         Competitor.objects.filter(
-            start_time__gte=event.start_date, device_id__in=devices
+            start_time__gte=event.start_date,
+            start_time__lte=max_end_date,
+            device_id__in=devices_used,
         )
         .only("device_id", "start_time")
         .order_by("start_time")
     )
     start_times_by_device = {}
-    for c in all_devices_competitors:
-        start_times_by_device.setdefault(c.device_id, [])
-        start_times_by_device[c.device_id].append(c.start_time)
-    nb_points = 0
-    results = []
-    for c in competitors:
-        from_date = c.start_time
-        next_competitor_start_time = None
-        if c.device_id:
-            for nxt in start_times_by_device.get(c.device_id, []):
-                if nxt > c.start_time:
-                    next_competitor_start_time = nxt
+    for competitor in competitors_for_devices_during_event:
+        start_times_by_device.setdefault(competitor.device_id, [])
+        start_times_by_device[competitor.device_id].append(competitor.start_time)
+
+    total_nb_pts = 0
+    competitors_data = []
+
+    for competitor in competitors:
+        from_date = competitor.start_time
+        end_date = max_end_date
+        if competitor.device_id:
+            for start_time in start_times_by_device.get(competitor.device_id, []):
+                if from_date < start_time < end_date:
+                    end_date = start_time
                     break
-        end_date = now()
-        if next_competitor_start_time:
-            end_date = min(next_competitor_start_time, end_date)
-        end_date = min(event.end_date, end_date)
-        nb, encoded_data = (0, "")
-        if c.device_id:
-            nb, encoded_data = c.device.get_locations_between_dates(
-                from_date, end_date, encoded=True
+        encoded_data = ""
+        if competitor.device_id:
+            encoded_data, nb_pts = competitor.device.get_locations_between_dates(
+                from_date, end_date, encode=True
             )
-        nb_points += nb
-        c_data = {
-            "id": c.aid,
+            total_nb_pts += nb_pts
+        competitor_data = {
+            "id": competitor.aid,
             "encoded_data": encoded_data,
-            "name": c.name,
-            "short_name": c.short_name,
-            "start_time": c.start_time,
+            "name": competitor.name,
+            "short_name": competitor.short_name,
+            "start_time": competitor.start_time,
         }
-        if event.is_live and c.device_id:
-            c_data["battery_level"] = c.device.battery_level
-        results.append(c_data)
-    res = {
-        "competitors": results,
-        "nb_points": nb_points,
+        if event.is_live and competitor.device_id:
+            competitor_data["battery_level"] = competitor.device.battery_level
+        competitors_data.append(competitor_data)
+
+    response = {
+        "competitors": competitors_data,
+        "nb_points": total_nb_pts,
         "duration": (time.time() - t0),
         "timestamp": time.time(),
     }
 
-    headers = {}
+    headers = {"ETag": f'W/"{safe64encodedsha(json.dumps(response))}"'}
     if event.privacy == PRIVACY_PRIVATE:
         headers["Cache-Control"] = "Private"
 
     if use_cache:
         try:
-            cache.set(cache_key, res, 20 if event.is_live else 7 * 24 * 3600 + 60)
+            cache.set(cache_key, response, 20 if event.is_live else 7 * 24 * 3600 + 60)
         except Exception:
             pass
 
-    return Response(res, headers=headers)
+    return Response(response, headers=headers)
 
 
 @swagger_auto_schema(
@@ -1288,7 +1315,7 @@ def locations_api_gw(request):
             "Latitudes, longitudes, and timestamps, should have same amount of points"
         )
     loc_array = []
-    for i in range(len(times)):
+    for i, _ in enumerate(times):
         if times[i] and lats[i] and lons[i]:
             lat = lats[i]
             lon = lons[i]
@@ -1335,6 +1362,15 @@ class DataRenderer(renderers.BaseRenderer):
 
     def render(self, data, media_type=None, renderer_context=None):
         return data
+
+
+@swagger_auto_schema(
+    method="get",
+    auto_schema=None,
+)
+@api_view(["GET"])
+def get_version(request):
+    return Response({"v": git_master_hash()})
 
 
 @swagger_auto_schema(
@@ -1390,7 +1426,11 @@ def create_device_id(request):
             raise ValidationError(str(e.message))
         status_code = status.HTTP_200_OK
         try:
-            idevice = ImeiDevice.objects.select_related("device").get(imei=imei)
+            idevice = (
+                ImeiDevice.objects.select_related("device")
+                .defer("device__locations_encoded")
+                .get(imei=imei)
+            )
         except ImeiDevice.DoesNotExist:
             device = Device.objects.create()
             idevice = ImeiDevice.objects.create(imei=imei, device=device)
@@ -1428,7 +1468,11 @@ def get_device_for_imei(request):
     except Exception as e:
         raise ValidationError(str(e.message))
     try:
-        idevice = ImeiDevice.objects.select_related("device").get(imei=imei)
+        idevice = (
+            ImeiDevice.objects.select_related("device")
+            .defer("device__locations_encoded")
+            .get(imei=imei)
+        )
     except ImeiDevice.DoesNotExist:
         device = Device.objects.create()
         idevice = ImeiDevice.objects.create(imei=imei, device=device)
@@ -1481,11 +1525,7 @@ def user_search(request):
 @login_required
 def user_view(request):
     user = request.user
-    if user.is_superuser:
-        clubs = Club.objects.all()
-    else:
-        clubs = Club.objects.filter(admins=user)
-
+    clubs = Club.objects.filter(admins=user)
     output = {
         "username": user.username,
         "clubs": [{"name": c.name, "slug": c.slug} for c in clubs],
@@ -1522,15 +1562,17 @@ def device_info(request, device_id):
     return Response(
         {
             "id": device.aid,
-            "last_position": {
-                "timestamp": device.last_location_timestamp,
-                "coordinates": {
-                    "latitude": device.last_location[LOCATION_LATITUDE_INDEX],
-                    "longitude": device.last_location[LOCATION_LONGITUDE_INDEX],
-                },
-            }
-            if device.last_location
-            else None,
+            "last_position": (
+                {
+                    "timestamp": device.last_location_timestamp,
+                    "coordinates": {
+                        "latitude": device.last_location[LOCATION_LATITUDE_INDEX],
+                        "longitude": device.last_location[LOCATION_LONGITUDE_INDEX],
+                    },
+                }
+                if device.last_location
+                else None
+            ),
         }
     )
 
@@ -1552,11 +1594,8 @@ def device_registrations(request, device_id):
 )
 @api_view(["PATCH", "DELETE"])
 @login_required
-def device_ownership_api_view(request, club_id, device_id):
-    if not request.user.is_superuser:
-        club = get_object_or_404(Club, admins=request.user, aid=club_id)
-    else:
-        club = get_object_or_404(Club, aid=club_id)
+def device_ownership_api_view(request, club_slug, device_id):
+    club = get_object_or_404(Club, slug=club_slug)
     device = get_object_or_404(Device, aid=device_id, is_gpx=False)
 
     ownership, _created = DeviceClubOwnership.objects.get_or_create(
@@ -1579,15 +1618,16 @@ def device_ownership_api_view(request, club_id, device_id):
     method="get",
     auto_schema=None,
 )
-@api_view(["GET"])
+@api_view(["GET", "HEAD"])
 def event_map_download(request, event_id, map_index="1"):
     event, raster_map = Event.get_public_map_at_index(request.user, event_id, map_index)
     file_path = raster_map.path
     mime_type = raster_map.mime_type
 
-    headers = None
+    headers = {}
     if event.privacy == PRIVACY_PRIVATE:
-        headers = {"Cache-Control": "Private"}
+        headers["Cache-Control"] = "Private"
+
     return serve_from_s3(
         settings.AWS_S3_BUCKET,
         request,
@@ -1607,45 +1647,23 @@ def event_map_download(request, event_id, map_index="1"):
     method="get",
     auto_schema=None,
 )
-@api_view(["GET"])
-def event_map_thumb_download(request, event_id):
-    event = get_object_or_404(
-        Event.objects.all().select_related("club", "map"),
-        aid=event_id,
-    )
-    if event.privacy == PRIVACY_PRIVATE and not request.user.is_superuser:
-        if (
-            not request.user.is_authenticated
-            or not event.club.admins.filter(id=request.user.id).exists()
-        ):
-            raise PermissionDenied()
-    data_out = event.thumbnail()
-    headers = None
-    if event.privacy == PRIVACY_PRIVATE:
-        headers = {"Cache-Control": "Private"}
-
-    return StreamingHttpRangeResponse(request, data_out, headers=headers)
-
-
-@swagger_auto_schema(
-    method="get",
-    auto_schema=None,
-)
-@api_view(["GET"])
+@api_view(["GET", "HEAD"])
 def event_kmz_download(request, event_id, map_index="1"):
     event, raster_map = Event.get_public_map_at_index(request.user, event_id, map_index)
     kmz_data = raster_map.kmz
 
-    headers = None
+    headers = {}
     if event.privacy == PRIVACY_PRIVATE:
-        headers = {"Cache-Control": "Private"}
+        headers["Cache-Control"] = "Private"
+
+    filename = f"{raster_map.name}.kmz"
     response = StreamingHttpRangeResponse(
         request,
         kmz_data,
         content_type="application/vnd.google-earth.kmz",
         headers=headers,
     )
-    filename = f"{raster_map.name}.kmz"
+    response["ETag"] = f'W/"{safe64encodedsha(kmz_data)}"'
     response["Content-Disposition"] = set_content_disposition(filename)
     return response
 
@@ -1654,17 +1672,11 @@ def event_kmz_download(request, event_id, map_index="1"):
     method="get",
     auto_schema=None,
 )
-@api_view(["GET"])
+@api_view(["GET", "HEAD"])
 @login_required
 def map_kmz_download(request, map_id, *args, **kwargs):
-    if request.user.is_superuser:
-        raster_map = get_object_or_404(
-            Map,
-            aid=map_id,
-        )
-    else:
-        club_list = Club.objects.filter(admins=request.user)
-        raster_map = get_object_or_404(Map, aid=map_id, club__in=club_list)
+    club_list = Club.objects.filter(admins=request.user)
+    raster_map = get_object_or_404(Map, aid=map_id, club__in=club_list)
     kmz_data = raster_map.kmz
     response = StreamingHttpRangeResponse(
         request,
@@ -1681,24 +1693,23 @@ def map_kmz_download(request, map_id, *args, **kwargs):
     method="get",
     auto_schema=None,
 )
-@api_view(["GET"])
+@api_view(["GET", "HEAD"])
 def competitor_gpx_download(request, competitor_id):
     competitor = get_object_or_404(
-        Competitor.objects.all().select_related("event", "event__club", "device"),
+        Competitor.objects.select_related("event", "event__club", "device"),
         aid=competitor_id,
         start_time__lt=now(),
     )
     event = competitor.event
-    if event.privacy == PRIVACY_PRIVATE and not request.user.is_superuser:
-        if (
-            not request.user.is_authenticated
-            or not event.club.admins.filter(id=request.user.id).exists()
-        ):
-            raise PermissionDenied()
+
+    event.check_user_permission(request.user)
+
     gpx_data = competitor.gpx
-    headers = None
+
+    headers = {}
     if event.privacy == PRIVACY_PRIVATE:
-        headers = {"Cache-Control": "Private"}
+        headers["Cache-Control"] = "Private"
+
     response = StreamingHttpRangeResponse(
         request,
         gpx_data.encode(),
@@ -1719,48 +1730,50 @@ def two_d_rerun_race_status(request):
     event_id = request.GET.get("eventid")
     if not event_id:
         raise Http404()
-    event = get_object_or_404(
-        Event.objects.all()
-        .select_related("club", "map")
-        .prefetch_related(
-            "competitors",
-        ),
-        aid=event_id,
-        start_date__lt=now(),
+    map_idx = 1
+    if "/" in event_id:
+        event_id, map_idx = event_id.split("/", 1)
+        try:
+            map_idx = int(map_idx)
+        except Exception:
+            raise Http404()
+    if map_idx < 1:
+        raise Http404()
+    event, raster_map = Event.get_public_map_at_index(
+        request.user, event_id, map_idx, load_competitors=True
     )
-    if event.privacy == PRIVACY_PRIVATE and not request.user.is_superuser:
-        if (
-            not request.user.is_authenticated
-            or not event.club.admins.filter(id=request.user.id).exists()
-        ):
-            raise PermissionDenied()
+
+    event.check_user_permission(request.user)
+
     response_json = {
         "status": "OK",
         "racename": event.name,
         "racestarttime": event.start_date,
         "raceendtime": event.end_date,
-        "mapurl": f"{event.get_absolute_map_url()}?.jpg",
+        "mapurl": (
+            f"{event.get_absolute_map_url()}{map_idx if map_idx != 1 else ''}?.jpg"
+        ),
         "caltype": "3point",
-        "mapw": event.map.width,
-        "maph": event.map.height,
+        "mapw": raster_map.width,
+        "maph": raster_map.height,
         "calibration": [
             [
-                event.map.bound["topLeft"]["lon"],
-                event.map.bound["topLeft"]["lat"],
+                raster_map.bound["topLeft"]["lon"],
+                raster_map.bound["topLeft"]["lat"],
                 0,
                 0,
             ],
             [
-                event.map.bound["topRight"]["lon"],
-                event.map.bound["topRight"]["lat"],
-                event.map.width,
+                raster_map.bound["topRight"]["lon"],
+                raster_map.bound["topRight"]["lat"],
+                raster_map.width,
                 0,
             ],
             [
-                event.map.bound["bottomLeft"]["lon"],
-                event.map.bound["bottomLeft"]["lat"],
+                raster_map.bound["bottomLeft"]["lon"],
+                raster_map.bound["bottomLeft"]["lat"],
                 0,
-                event.map.height,
+                raster_map.height,
             ],
         ],
         "competitors": [],
@@ -1775,9 +1788,10 @@ def two_d_rerun_race_status(request):
         response_raw = f"/**/{callback}({response_raw});"
         content_type = "text/javascript; charset=utf-8"
 
-    headers = None
+    headers = {}
     if event.privacy == PRIVACY_PRIVATE:
-        headers = {"Cache-Control": "Private"}
+        headers["Cache-Control"] = "Private"
+
     return HttpResponse(response_raw, content_type=content_type, headers=headers)
 
 
@@ -1791,7 +1805,7 @@ def two_d_rerun_race_data(request):
     if not event_id:
         raise Http404()
     event = get_object_or_404(
-        Event.objects.all().prefetch_related(
+        Event.objects.prefetch_related(
             Prefetch(
                 "competitors",
                 queryset=Competitor.objects.select_related("device").order_by(
@@ -1802,12 +1816,8 @@ def two_d_rerun_race_data(request):
         aid=event_id,
         start_date__lt=now(),
     )
-    if event.privacy == PRIVACY_PRIVATE and not request.user.is_superuser:
-        if (
-            not request.user.is_authenticated
-            or not event.club.admins.filter(id=request.user.id).exists()
-        ):
-            raise PermissionDenied()
+
+    event.check_user_permission(request.user)
 
     competitors = event.competitors.all()
     devices = (c.device_id for c in competitors if c.device_id)
@@ -1824,7 +1834,7 @@ def two_d_rerun_race_data(request):
         start_times_by_device.setdefault(c.device_id, [])
         start_times_by_device[c.device_id].append(c.start_time)
 
-    nb_points = 0
+    total_nb_pts = 0
     results = []
     for c in competitors:
         from_date = c.start_time
@@ -1838,10 +1848,13 @@ def two_d_rerun_race_data(request):
         if next_competitor_start_time:
             end_date = min(next_competitor_start_time, end_date)
         end_date = min(event.end_date, end_date)
-        nb, locations = (0, "")
+        nb_pts = 0
+        locations = []
         if c.device_id:
-            nb, locations = c.device.get_locations_between_dates(from_date, end_date)
-        nb_points += nb
+            locations, nb_pts = c.device.get_locations_between_dates(
+                from_date, end_date
+            )
+        total_nb_pts += nb_pts
         results += [
             [
                 c.aid,
@@ -1854,7 +1867,7 @@ def two_d_rerun_race_data(request):
         ]
     response_json = {
         "containslastpos": 1,
-        "lastpos": nb_points,
+        "lastpos": total_nb_pts,
         "status": "OK",
         "data": results,
     }
@@ -1865,9 +1878,10 @@ def two_d_rerun_race_data(request):
         response_raw = f"/**/{callback}({response_raw});"
         content_type = "text/javascript; charset=utf-8"
 
-    headers = None
+    headers = {}
     if event.privacy == PRIVACY_PRIVATE:
-        headers = {"Cache-Control": "Private"}
+        headers["Cache-Control"] = "Private"
+
     return HttpResponse(
         response_raw,
         content_type=content_type,

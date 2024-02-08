@@ -58,36 +58,27 @@ var intValCodec = (function () {
   };
 })();
 
-var Coordinates = function (c) {
-  if (!(this instanceof Coordinates)) return new Coordinates(c);
-  this.latitude = c.latitude;
-  this.longitude = c.longitude;
-  this.accuracy = c.accuracy;
+var Coordinates = function (lat, lon) {
+  this.latitude = lat;
+  this.longitude = lon;
   this.distance = function (c) {
     var C = Math.PI / 180,
       dlat = this.latitude - c.latitude,
       dlon = this.longitude - c.longitude,
       a =
-        Math.pow(Math.sin((C * dlat) / 2), 2) +
+        Math.sin((C * dlat) / 2) * Math.sin((C * dlat) / 2) +
         Math.cos(C * this.latitude) *
           Math.cos(C * c.latitude) *
-          Math.pow(Math.sin((C * dlon) / 2), 2);
+          Math.sin((C * dlon) / 2) * Math.sin((C * dlon) / 2);
     return 12756274 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  };
-  this.distanceAccuracy = function (c) {
-    return this.accuracy + c.accurracy;
   };
 };
 
-var Position = function (l) {
-  if (!(this instanceof Position)) return new Position(l);
-  this.timestamp = l.timestamp;
-  this.coords = new Coordinates(l.coords);
+var Position = function (t, lat, lon) {
+  this.timestamp = t;
+  this.coords = new Coordinates(lat, lon);
   this.distance = function (p) {
     return this.coords.distance(p.coords);
-  };
-  this.distanceAccuracy = function (p) {
-    return this.coords.distanceAccuracy(p.coords);
   };
   this.speed = function (p) {
     return this.distance(p) / Math.abs(this.timestamp - p.timestamp);
@@ -98,20 +89,12 @@ var Position = function (l) {
       pc = p.coords,
       r = (timestamp - $t.timestamp) / (p.timestamp - $t.timestamp),
       r_ = 1 - r;
-    return new Position({
-      timestamp: timestamp,
-      coords: {
-        latitude: pc.latitude * r + r_ * $tc.latitude,
-        longitude: pc.longitude * r + r_ * $tc.longitude,
-        accuracy: pc.accuracy * r + r_ * $tc.accuracy,
-      },
-    });
+    return new Position(timestamp, Math.round((pc.latitude * r + r_ * $tc.latitude) * 1e6) / 1e6, Math.round((pc.longitude * r + r_ * $tc.longitude) * 1e6) / 1e6);
   };
 };
 
-var PositionArchive = function () {
-  if (!(this instanceof PositionArchive)) return new PositionArchive();
-  var positions = [],
+var PositionArchive = function (k) {
+  var positions = new Array(k),
     _locationOf = function (element, start, end) {
       start = typeof start !== "undefined" ? start : 0;
       end = typeof end !== "undefined" ? end : positions.length - 1;
@@ -137,6 +120,13 @@ var PositionArchive = function () {
         return _locationOf(element, start, pivot - 1);
       }
     };
+  this.slice = function(start, end) {
+    return (new PositionArchive(0)).setData(positions.slice(start, end));
+  }
+  this.setData = function(d) {
+    positions = d;
+    return this;
+  }
   this.add = function (pos) {
     if (pos.timestamp === null) {
       return;
@@ -162,6 +152,12 @@ var PositionArchive = function () {
 
   this.push = function (pos) {
     positions.push(pos);
+  };
+  this.setIndex = function (i, pos) {
+    positions[i]= pos;
+  };
+  this.setLength = function (l) {
+    positions.length = l;
   };
 
   this.eraseInterval = function (start, end) {
@@ -212,7 +208,9 @@ var PositionArchive = function () {
     var index = _locationOf({ timestamp: t1 }),
       i1,
       i2,
-      result = new PositionArchive();
+      result,
+      i1B = false,
+      i2B = false;
     if (index === 0) {
       i1 = 0;
     } else if (index > positions.length - 1) {
@@ -220,9 +218,7 @@ var PositionArchive = function () {
     } else if (positions[index].timestamp === t1) {
       i1 = index;
     } else {
-      result.add(
-        positions[index - 1].positionTowardAtTimestamp(positions[index], t1)
-      );
+      i1B = true;
       i1 = index;
     }
     index = _locationOf({ timestamp: t2 });
@@ -233,13 +229,20 @@ var PositionArchive = function () {
     } else if (positions[index].timestamp === t2) {
       i2 = index;
     } else {
-      result.add(
-        positions[index - 1].positionTowardAtTimestamp(positions[index], t2)
-      );
+      i2B = true;
       i2 = index - 1;
     }
-    for (var i = i1; i <= i2; i++) {
-      result.add(positions[i]);
+
+    result = this.slice(i1, i2 + 1);
+    if (i1B) {
+      result.add(
+        positions[i1 - 1].positionTowardAtTimestamp(positions[i1], t1)
+      );
+    }
+    if (i2B) {
+      result.add(
+        positions[i2].positionTowardAtTimestamp(positions[i2 + 1], t2)
+      );
     }
     return result;
   };
@@ -282,10 +285,11 @@ PositionArchive.fromEncoded = function (encoded) {
     vals = [],
     prev_vals = [YEAR2010, 0, 0],
     enc_len = encoded.length,
-    pts = new PositionArchive(),
+    pts = new PositionArchive(Math.floor(enc_len/3)),
     r,
     is_first = true,
-    offset = 0;
+    offset = 0,
+    k = 0;
 
   while (offset < enc_len) {
     for (var i = 0; i < 3; i++) {
@@ -304,17 +308,9 @@ PositionArchive.fromEncoded = function (encoded) {
       vals[i] = new_val;
       prev_vals[i] = new_val;
     }
-    pts.push(
-      new Position({
-        timestamp: vals[0] * 1e3,
-        coords: {
-          latitude: vals[1] / 1e5,
-          longitude: vals[2] / 1e5,
-          accuracy: 0,
-        },
-      })
-    );
-    enc_len = encoded.length;
+    pts.setIndex(k, new Position(vals[0] * 1e3, vals[1] / 1e5, vals[2] / 1e5));
+    k++;
   }
+  pts.setLength(k)
   return pts;
 };
